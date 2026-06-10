@@ -1,0 +1,2 @@
+pip install torch ninja numpy
+python setup.py build_ext --inplace
