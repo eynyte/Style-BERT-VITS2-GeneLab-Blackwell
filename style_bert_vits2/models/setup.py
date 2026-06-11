@@ -1,17 +1,49 @@
 """
 setup.py
 nvcc でビルドするためのスクリプト。
-
 使い方:
     python setup.py build_ext --inplace
-
 ビルド後、同ディレクトリに
     monotonic_align_cuda_core.cpython-3XX-linux-gnu.so
 が生成される。
-"""
 
+現在接続されているすべての GPU の SM アーキテクチャを自動検出し、
+そのアーキテクチャだけをターゲットにビルドします。
+"""
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import torch
+
+
+def get_gencode_flags() -> list[str]:
+    """接続中の GPU から SM を自動検出して -gencode フラグを返す。"""
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA が利用できません。GPU ドライバと PyTorch (CUDA 版) を確認してください。"
+        )
+
+    seen: set[tuple[int, int]] = set()
+    flags: list[str] = []
+
+    for i in range(torch.cuda.device_count()):
+        major, minor = torch.cuda.get_device_capability(i)
+        cap = (major, minor)
+        if cap in seen:
+            continue
+        seen.add(cap)
+
+        arch = f"{major}{minor}"
+        flags.append(f"-gencode=arch=compute_{arch},code=sm_{arch}")
+        print(
+            f"  GPU {i}: {torch.cuda.get_device_name(i)}  →  sm_{arch} を追加"
+        )
+
+    return flags
+
+
+print(">>> GPU SM アーキテクチャを自動検出中...")
+gencode_flags = get_gencode_flags()
+print(f">>> 使用する gencode フラグ: {gencode_flags}\n")
 
 setup(
     name="monotonic_align_cuda_core",
@@ -21,18 +53,7 @@ setup(
             sources=["core.cu"],
             extra_compile_args={
                 "nvcc": [
-                    # SM アーキテクチャ: 環境に合わせて追加・削除してください
-                    # Turing  (RTX 20xx)       : sm_75
-                    # Ampere  (RTX 30xx, A100) : sm_80, sm_86
-                    # Ada     (RTX 40xx)       : sm_89
-                    # Hopper  (H100)           : sm_90
-                    "-gencode=arch=compute_75,code=sm_75",
-                    "-gencode=arch=compute_80,code=sm_80",
-                    "-gencode=arch=compute_86,code=sm_86",
-                    "-gencode=arch=compute_89,code=sm_89",
-                    "-gencode=arch=compute_90,code=sm_90",
-                    "-gencode=arch=compute_100,code=sm_100",
-                    "-gencode=arch=compute_120,code=sm_120",
+                    *gencode_flags,
                     "--use_fast_math",
                     "-O3",
                 ],
