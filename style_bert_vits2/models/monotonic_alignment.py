@@ -120,9 +120,7 @@ def _try_load_cuda_ext() -> Any:
     # まず通常の import を試みる（パスが通っていれば最速）
     try:
         ext = importlib.import_module(_MODULE_NAME)
-        logger.info(
-            "[monotonic_alignment] CUDAカーネル版をロードしました（通常import）。"
-        )
+        print(f"[monotonic_alignment] CUDAカーネル版をロードしました（通常import）。")
         return ext
     except ModuleNotFoundError:
         pass
@@ -130,11 +128,10 @@ def _try_load_cuda_ext() -> Any:
     # 通常 import が失敗した場合、.so を手動で探してロードする
     so_path = _find_and_rename_so()
     if so_path is None:
-        logger.warning(
-            f"[monotonic_alignment] {_MODULE_NAME} の .so が見つかりません。"
-            " Numba JIT にフォールバックします。\n"
-            "  ビルドするには: cd monotonic_align_cuda && "
-            "python setup.py build_ext --inplace"
+        print(
+            f"[monotonic_alignment] {_MODULE_NAME} の .so が見つかりません。\n"
+            f"Numba JIT にフォールバックします。\n"
+            f"ビルドするには: cd monotonic_align_cuda && python setup.py build_ext --inplace"
         )
         return None
 
@@ -145,17 +142,11 @@ def _try_load_cuda_ext() -> Any:
         ext = importlib.util.module_from_spec(spec)
         sys.modules[_MODULE_NAME] = ext
         spec.loader.exec_module(ext)  # type: ignore[union-attr]
-        logger.info(
-            f"[monotonic_alignment] CUDAカーネル版をロードしました: {so_path.name}"
-        )
+        print(f"[monotonic_alignment] CUDAカーネル版をロードしました: {so_path.name}")
         return ext
     except Exception as e:
-        logger.warning(
-            f"[monotonic_alignment] .so のロードに失敗しました ({e})。"
-            " Numba JIT にフォールバックします。"
-        )
+        print(f"[monotonic_alignment] .so のロードに失敗しました ({e})。Numba JIT にフォールバックします。")
         return None
-
 
 _cuda_ext = _try_load_cuda_ext()
 
