@@ -17,6 +17,7 @@ Note:
     pyproject.toml の探索をスキップしている。
 """
 import sys
+import os
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 from setuptools.dist import Distribution
@@ -74,4 +75,11 @@ dist = Distribution(
 dist.script_name = sys.argv[0]
 dist.script_args = sys.argv[1:]
 dist.parse_command_line()
-dist.run_commands()
+
+# setup.py のあるディレクトリへ移動し、終了後(例外時も)元のディレクトリへ戻る
+_original_dir = os.getcwd()
+try:
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    dist.run_commands()
+finally:
+    os.chdir(_original_dir)
