@@ -20,7 +20,8 @@ def init_weights(m: torch.nn.Module, mean: float = 0.0, std: float = 0.01) -> No
     """
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
-        m.weight.data.normal_(mean, std)
+        with torch.no_grad():
+            m.weight.normal_(mean, std)
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -82,9 +83,10 @@ def slice_segments(
     Returns:
         torch.Tensor: スライスされたセグメント
     """
-    gather_indices = ids_str.view(x.size(0), 1, 1).repeat(
-        1, x.size(1), 1
-    ) + torch.arange(segment_size, device=x.device)
+    gather_indices = ids_str.view(x.size(0), 1, 1) + torch.arange(
+        segment_size, device=x.device
+    ).view(1, 1, -1)
+    gather_indices = gather_indices.expand(-1, x.size(1), -1)
     return torch.gather(x, 2, gather_indices)
 
 
@@ -102,16 +104,25 @@ def rand_slice_segments(
     Returns:
         tuple[torch.Tensor, torch.Tensor]: スライスされたセグメントと開始インデックス
     """
-    b, d, t = x.size()
+    b, _, t = x.size()
     if x_lengths is None:
-        x_lengths = t  # type: ignore
-    ids_str_max = torch.clamp(x_lengths - segment_size + 1, min=0)  # type: ignore
-    ids_str = (torch.rand([b], device=x.device) * ids_str_max).to(dtype=torch.long)
+        ids_str_max = torch.full(
+            (b,), max(t - segment_size + 1, 0), dtype=torch.long, device=x.device
+        )
+    else:
+        ids_str_max = torch.clamp(x_lengths - segment_size + 1, min=0)
+    ids_str = (
+        torch.rand(b, device=x.device) * ids_str_max.to(dtype=torch.float32)
+    ).to(dtype=torch.long)
     ret = slice_segments(x, ids_str, segment_size)
     return ret, ids_str
 
 
-def subsequent_mask(length: int) -> torch.Tensor:
+def subsequent_mask(
+    length: int,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
     """
     後続のマスクを生成する
 
@@ -121,7 +132,14 @@ def subsequent_mask(length: int) -> torch.Tensor:
     Returns:
         torch.Tensor: 生成されたマスク
     """
-    mask = torch.tril(torch.ones(length, length)).unsqueeze(0).unsqueeze(0)
+    mask = torch.tril(
+        torch.ones(
+            length,
+            length,
+            device=device,
+            dtype=dtype if dtype is not None else torch.float32,
+        )
+    ).unsqueeze(0).unsqueeze(0)
     return mask
 
 
@@ -184,7 +202,7 @@ def generate_path(duration: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     cum_duration_flat = cum_duration.view(b * t_x)
     path = sequence_mask(cum_duration_flat, t_y).to(mask.dtype)
     path = path.view(b, t_x, t_y)
-    path = path - F.pad(path, convert_pad_shape([[0, 0], [1, 0], [0, 0]]))[:, :-1]
+    path = path - F.pad(path, (0, 0, 1, 0, 0, 0))[:, :-1]
     path = path.unsqueeze(1).transpose(2, 3) * mask
     return path
 
@@ -193,7 +211,7 @@ def clip_grad_value_(
     parameters: Union[torch.Tensor, list[torch.Tensor]],
     clip_value: Optional[float],
     norm_type: float = 2.0,
-) -> float:
+) -> Union[float, torch.Tensor]:
     """
     勾配の値をクリップする
 
@@ -207,17 +225,42 @@ def clip_grad_value_(
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    grads = [p.grad.detach() for p in parameters if p.grad is not None]
     norm_type = float(norm_type)
     if clip_value is not None:
         clip_value = float(clip_value)
 
-    total_norm = 0.0
-    for p in parameters:
-        assert p.grad is not None
-        param_norm = p.grad.data.norm(norm_type)
-        total_norm += param_norm.item() ** norm_type
-        if clip_value is not None:
-            p.grad.data.clamp_(min=-clip_value, max=clip_value)
-    total_norm = total_norm ** (1.0 / norm_type)
+    if len(grads) == 0:
+        return 0.0
+
+    first_device = grads[0].device
+    same_device = all(grad.device == first_device for grad in grads)
+
+    if same_device:
+        if hasattr(torch, "_foreach_norm"):
+            try:
+                norms = torch._foreach_norm(grads, norm_type)
+            except (RuntimeError, TypeError):
+                norms = [torch.linalg.vector_norm(grad, ord=norm_type) for grad in grads]
+        else:
+            norms = [torch.linalg.vector_norm(grad, ord=norm_type) for grad in grads]
+        norms = [norm.to(device=first_device, dtype=torch.float32) for norm in norms]
+        total_norm = torch.linalg.vector_norm(torch.stack(norms), ord=norm_type)
+    else:
+        total_norm = 0.0
+        for grad in grads:
+            total_norm += grad.norm(norm_type).item() ** norm_type
+        total_norm = total_norm ** (1.0 / norm_type)
+
+    if clip_value is not None:
+        if same_device and hasattr(torch, "_foreach_clamp_"):
+            try:
+                torch._foreach_clamp_(grads, min=-clip_value, max=clip_value)
+            except (RuntimeError, TypeError):
+                for grad in grads:
+                    grad.clamp_(min=-clip_value, max=clip_value)
+        else:
+            for grad in grads:
+                grad.clamp_(min=-clip_value, max=clip_value)
+
     return total_norm

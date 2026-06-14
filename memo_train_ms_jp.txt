@@ -1,0 +1,24 @@
+﻿改善を入れました。主にH100/H200/B200で効きやすい「CPU同期の削減」と「無駄なbackward削減」です。
+変更箇所:
+[train_ms_jp_extra.py](D:/1akkkkkkkkk/Style-BERT-VITS2-GeneLab-Blackwell-master/Style-BERT-VITS2-GeneLab-Blackwell-master/train_ms_jp_extra.py)
+cudnn.benchmark=True、BF16 reduction許可を追加
+num_workers=1 固定をやめ、config.yml の train_ms.num_workers を使用
+BF16時、BERT/style特徴量をGPU転送時にBF16化
+BF16では不要な GradScaler を無効化
+毎stepのgrad norm同期をログ時だけに削減
+生成器更新時に判別器側の重み勾配を一時停止して、不要なbackward/DDP同期を削減
+DDPに gradient_as_bucket_view=True / broadcast_buffers=False
+SBV2_TORCH_COMPILE=1 の時だけ torch.compile を試せる任意機能を追加
+
+[losses.py](D:/1akkkkkkkkk/Style-BERT-VITS2-GeneLab-Blackwell-master/Style-BERT-VITS2-GeneLab-Blackwell-master/losses.py)
+discriminator_loss() 内の毎step .item() を削除
+これはかなり重要で、H100系でGPUがCPU待ちになる原因になりやすいです。
+
+[monotonic_alignment.py](D:/1akkkkkkkkk/Style-BERT-VITS2-GeneLab-Blackwell-master/Style-BERT-VITS2-GeneLab-Blackwell-master/style_bert_vits2/models/monotonic_alignment.py)
+CUDA拡張 .so が無い場合、Linux上で初回に core.cu をJITビルドしてロードするようにしました
+それも失敗した場合だけNumba CPUフォールバックへ落ち、警告を出します
+
+確認:
+python -B -m py_compile train_ms_jp_extra.py losses.py style_bert_vits2\models\monotonic_alignment.py は通りました。
+Linux/H100実機での学習実行はこの環境では再現できないため未実行です。
+Linuxで初回実行時に core.cu をJITビルドします と出たら正常です。そこで失敗してNumbaフォールバック警告が出る場合、MASがまだ大きなボトルネックなので、CUDA Toolkit/nvcc環境を確認してください。任意で SBV2_TORCH_COMPILE=1 を付けて比較すると、モデル形状が安定している環境ではさらに伸びる可能性があります。

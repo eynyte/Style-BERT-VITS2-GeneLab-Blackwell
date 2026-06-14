@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 # CUDAカーネルのロード試行
 # ---------------------------------------------------------------------------
 _cuda_ext = None
+_jit_compile_attempted = False
+_cpu_fallback_warned = False
 
 # .so が置かれているディレクトリ候補（このファイルと同じ場所 → プロジェクトルートの順）
 _SO_SEARCH_DIRS: list[Path] = [
@@ -145,7 +147,50 @@ def _try_load_cuda_ext() -> Any:
         print(f"[monotonic_alignment] CUDAカーネル版をロードしました: {so_path.name}")
         return ext
     except Exception as e:
+        sys.modules.pop(_MODULE_NAME, None)
         print(f"[monotonic_alignment] .so のロードに失敗しました ({e})。Numba JIT にフォールバックします。")
+        return None
+
+
+def _try_jit_build_cuda_ext() -> Any:
+    """
+    ビルド済み .so が見つからない場合、core.cu を PyTorch の拡張キャッシュへ
+    JIT ビルドしてロードする。Linux + CUDA Toolkit がある環境向け。
+    """
+    global _jit_compile_attempted
+    if _jit_compile_attempted:
+        return None
+    _jit_compile_attempted = True
+
+    core_path = Path(__file__).with_name("core.cu")
+    if not core_path.exists():
+        print(
+            f"[monotonic_alignment] {core_path} が見つかりません。"
+            "Numba JIT にフォールバックします。"
+        )
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+
+        sys.modules.pop(_MODULE_NAME, None)
+        print(
+            "[monotonic_alignment] CUDAカーネル版が未ビルドのため、"
+            "core.cu をJITビルドします。初回のみ時間がかかります。"
+        )
+        ext = load(
+            name=_MODULE_NAME,
+            sources=[str(core_path)],
+            extra_cuda_cflags=["--use_fast_math", "-O3"],
+            verbose=False,
+        )
+        print("[monotonic_alignment] CUDAカーネル版をJITロードしました。")
+        return ext
+    except Exception as e:
+        print(
+            f"[monotonic_alignment] CUDAカーネル版のJITビルドに失敗しました ({e})。"
+            "Numba JIT にフォールバックします。"
+        )
         return None
 
 _cuda_ext = _try_load_cuda_ext()
@@ -166,10 +211,20 @@ def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     Returns:
         path     : [B, T_y, T_x]  neg_cent と同じ dtype / device
     """
-    if _cuda_ext is not None and neg_cent.is_cuda:
-        return _maximum_path_cuda(neg_cent, mask)
-    else:
-        return _maximum_path_numba(neg_cent, mask)
+    global _cuda_ext, _cpu_fallback_warned
+    if neg_cent.is_cuda:
+        if _cuda_ext is None:
+            _cuda_ext = _try_jit_build_cuda_ext()
+        if _cuda_ext is not None:
+            return _maximum_path_cuda(neg_cent, mask)
+        if not _cpu_fallback_warned:
+            _cpu_fallback_warned = True
+            print(
+                "[monotonic_alignment] 警告: CUDAカーネルが使えないため、"
+                "MASでGPU↔CPU転送が発生します。H100/H200/B200では大きな"
+                "ボトルネックになります。"
+            )
+    return _maximum_path_numba(neg_cent, mask)
 
 
 # ---------------------------------------------------------------------------

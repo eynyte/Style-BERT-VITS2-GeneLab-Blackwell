@@ -195,8 +195,8 @@ class Decoder(nn.Module):
         x: decoder input
         h: encoder output
         """
-        self_attn_mask = commons.subsequent_mask(x_mask.size(2)).to(
-            device=x.device, dtype=x.dtype
+        self_attn_mask = commons.subsequent_mask(
+            x_mask.size(2), device=x.device, dtype=x.dtype
         )
         encdec_attn_mask = h_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
