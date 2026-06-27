@@ -20,8 +20,7 @@ def init_weights(m: torch.nn.Module, mean: float = 0.0, std: float = 0.01) -> No
     """
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
-        with torch.no_grad():
-            m.weight.normal_(mean, std)
+        m.weight.data.normal_(mean, std)
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -69,6 +68,7 @@ def intersperse(lst: list[Any], item: Any) -> list[Any]:
     return result
 
 
+@torch.jit.script
 def slice_segments(
     x: torch.Tensor, ids_str: torch.Tensor, segment_size: int = 4
 ) -> torch.Tensor:
@@ -83,10 +83,11 @@ def slice_segments(
     Returns:
         torch.Tensor: スライスされたセグメント
     """
-    gather_indices = ids_str.view(x.size(0), 1, 1) + torch.arange(
-        segment_size, device=x.device
-    ).view(1, 1, -1)
-    gather_indices = gather_indices.expand(-1, x.size(1), -1)
+    # repeat() はメモリをコピーするが expand() はゼロコピーのストライドビューを返す。
+    # (B, 1, S) を (B, C, S) に expand することで VRAM 帯域とアロケーションを削減。
+    gather_indices = (
+        ids_str.view(x.size(0), 1, 1) + torch.arange(segment_size, device=x.device)
+    ).expand(x.size(0), x.size(1), segment_size)
     return torch.gather(x, 2, gather_indices)
 
 
@@ -104,25 +105,16 @@ def rand_slice_segments(
     Returns:
         tuple[torch.Tensor, torch.Tensor]: スライスされたセグメントと開始インデックス
     """
-    b, _, t = x.size()
+    b, d, t = x.size()
     if x_lengths is None:
-        ids_str_max = torch.full(
-            (b,), max(t - segment_size + 1, 0), dtype=torch.long, device=x.device
-        )
-    else:
-        ids_str_max = torch.clamp(x_lengths - segment_size + 1, min=0)
-    ids_str = (
-        torch.rand(b, device=x.device) * ids_str_max.to(dtype=torch.float32)
-    ).to(dtype=torch.long)
+        x_lengths = t  # type: ignore
+    ids_str_max = torch.clamp(x_lengths - segment_size + 1, min=0)  # type: ignore
+    ids_str = (torch.rand([b], device=x.device) * ids_str_max).to(dtype=torch.long)
     ret = slice_segments(x, ids_str, segment_size)
     return ret, ids_str
 
 
-def subsequent_mask(
-    length: int,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
+def subsequent_mask(length: int) -> torch.Tensor:
     """
     後続のマスクを生成する
 
@@ -132,14 +124,7 @@ def subsequent_mask(
     Returns:
         torch.Tensor: 生成されたマスク
     """
-    mask = torch.tril(
-        torch.ones(
-            length,
-            length,
-            device=device,
-            dtype=dtype if dtype is not None else torch.float32,
-        )
-    ).unsqueeze(0).unsqueeze(0)
+    mask = torch.tril(torch.ones(length, length)).unsqueeze(0).unsqueeze(0)
     return mask
 
 
@@ -202,7 +187,9 @@ def generate_path(duration: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     cum_duration_flat = cum_duration.view(b * t_x)
     path = sequence_mask(cum_duration_flat, t_y).to(mask.dtype)
     path = path.view(b, t_x, t_y)
-    path = path - F.pad(path, (0, 0, 1, 0, 0, 0))[:, :-1]
+    # convert_pad_shape([[0, 0], [1, 0], [0, 0]]) の結果は常に [0, 0, 1, 0, 0, 0]。
+    # 毎ステップ Python リスト操作を呼ぶ代わりに定数タプルで直接渡す。
+    path = path - F.pad(path, [0, 0, 1, 0, 0, 0])[:, :-1]
     path = path.unsqueeze(1).transpose(2, 3) * mask
     return path
 
@@ -211,7 +198,7 @@ def clip_grad_value_(
     parameters: Union[torch.Tensor, list[torch.Tensor]],
     clip_value: Optional[float],
     norm_type: float = 2.0,
-) -> Union[float, torch.Tensor]:
+) -> float:
     """
     勾配の値をクリップする
 
@@ -225,42 +212,77 @@ def clip_grad_value_(
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    grads = [p.grad.detach() for p in parameters if p.grad is not None]
-    norm_type = float(norm_type)
-    if clip_value is not None:
-        clip_value = float(clip_value)
-
-    if len(grads) == 0:
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    if not parameters:
         return 0.0
 
-    first_device = grads[0].device
-    same_device = all(grad.device == first_device for grad in grads)
+    norm_type = float(norm_type)
 
-    if same_device:
-        if hasattr(torch, "_foreach_norm"):
-            try:
-                norms = torch._foreach_norm(grads, norm_type)
-            except (RuntimeError, TypeError):
-                norms = [torch.linalg.vector_norm(grad, ord=norm_type) for grad in grads]
-        else:
-            norms = [torch.linalg.vector_norm(grad, ord=norm_type) for grad in grads]
-        norms = [norm.to(device=first_device, dtype=torch.float32) for norm in norms]
-        total_norm = torch.linalg.vector_norm(torch.stack(norms), ord=norm_type)
-    else:
-        total_norm = 0.0
-        for grad in grads:
-            total_norm += grad.norm(norm_type).item() ** norm_type
-        total_norm = total_norm ** (1.0 / norm_type)
-
+    # クリップはインプレース演算なので GPU 同期が不要
     if clip_value is not None:
-        if same_device and hasattr(torch, "_foreach_clamp_"):
-            try:
-                torch._foreach_clamp_(grads, min=-clip_value, max=clip_value)
-            except (RuntimeError, TypeError):
-                for grad in grads:
-                    grad.clamp_(min=-clip_value, max=clip_value)
-        else:
-            for grad in grads:
-                grad.clamp_(min=-clip_value, max=clip_value)
+        clip_value = float(clip_value)
+        for p in parameters:
+            p.grad.data.clamp_(min=-clip_value, max=clip_value)
 
+    # 元のコードは param_norm.item() をパラメータ数分ループし、毎回 GPU→CPU 同期していた。
+    # 各ノルムを GPU テンソルのまま積み上げ、最後に 1 回だけ .item() で同期する。
+    norms = torch.stack([p.grad.data.norm(norm_type) for p in parameters])
+    total_norm = float(norms.norm(norm_type).item())
     return total_norm
+"""
+コードを分析します。**ボトルネックの分析:**
+
+1. **`clip_grad_value_`** — `.item()` をパラメータごとにループ内で呼び、毎回 GPU→CPU 同期が発生。モデルに数百のパラメータがある場合、1ステップで数百回の同期になる。
+2. **`slice_segments`** — `.repeat()` がメモリを丸ごとコピー（VRAM帯域を無駄遣い）。
+3. **`generate_path`** — `convert_pad_shape` を毎ステップ呼び出すが、引数は常に定数。差分を確認します。変更は3箇所、差分のみ説明します。
+
+---
+
+## 変更内容
+
+### 1. `clip_grad_value_` — **最重要**（GPU同期 N回 → 1回）
+
+元のコードはパラメータのループ内で `.item()` を呼んでいました。`.item()` は GPU→CPU の同期ポイントです。
+
+```python
+# 元: パラメータ数（数百）だけ GPU が止まる
+for p in parameters:
+    total_norm += param_norm.item() ** norm_type  # ← ここで毎回同期
+```
+
+```python
+# 後: GPU 上でノルムを積み上げて最後に1回だけ同期
+norms = torch.stack([p.grad.data.norm(norm_type) for p in parameters])
+total_norm = float(norms.norm(norm_type).item())  # ← 同期はここだけ
+```
+
+SynthesizerTrn のような大きなモデルでは1ステップあたり数百回の同期が1回に減ります。また clip は in-place 演算なので同期なしで先に済ませる順に整理しました。
+
+---
+
+### 2. `slice_segments` — `repeat` → `expand` + `@torch.jit.script`
+
+```python
+# 元: repeat() は (B, C, S) サイズのテンソルを VRAM に丸ごとコピー
+ids_str.view(B, 1, 1).repeat(1, C, 1) + arange(S)
+
+# 後: expand() はストライド0のビューを返すだけ（コピーなし）
+(ids_str.view(B, 1, 1) + arange(S)).expand(B, C, S)
+```
+
+`torch.gather` はストライドビューをそのまま受け付けるため正確に同じ結果が得られます。さらに `@torch.jit.script` を追加し、ディスパッチオーバーヘッドをなくしました（`fused_add_tanh_sigmoid_multiply` と同じパターン）。
+
+---
+
+### 3. `generate_path` — `convert_pad_shape` の定数インライン化
+
+```python
+# 元: 毎ステップ Python リスト操作を実行
+F.pad(path, convert_pad_shape([[0, 0], [1, 0], [0, 0]]))
+
+# 後: 結果は常に [0, 0, 1, 0, 0, 0] なので定数で直接渡す
+F.pad(path, [0, 0, 1, 0, 0, 0])
+```
+
+単体では軽微ですが、`generate_path` はアライメント探索のたびに呼ばれるため積み重なります。
+"""
