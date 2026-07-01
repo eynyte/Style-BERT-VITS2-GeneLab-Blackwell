@@ -369,24 +369,28 @@ def run():
             param.requires_grad = False
 
     net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(local_rank)
-    # NOTE: fused=True にすると、パラメータテンソル毎に個別のカーネルを
-    # 起動する代わりに、Adam の更新を 1 回の fused multi-tensor カーネルに
-    # まとめて実行する。net_g のようにパラメータ数が多いモデルでは、
-    # optimizer.step() 呼び出し毎の CPU 側のカーネル起動オーバーヘッドが
-    # 大きく減る。全パラメータが CUDA 上にあるため安全に有効化できる。
+    # NOTE: 当初 fused=True (パラメータ毎の個別カーネル起動を 1 回の fused
+    # multi-tensor カーネルにまとめて CPU 側の起動オーバーヘッドを減らす狙い)
+    # を試みたが、実環境で
+    #   RuntimeError: params, grads, exp_avgs, and exp_avg_sqs must have
+    #   same dtype, device, and layout
+    # が発生し学習が落ちたため撤回した。freeze_JP_bert 等で requires_grad が
+    # 混在するパラメータ集合や、事前学習済みベースモデルの読み込みと
+    # 組み合わさった際に、fused カーネルが要求する dtype/device/layout の
+    # 均一性が崩れるケースがあるためと考えられる。fused はこのオーバーヘッド
+    # 削減の本題（GradScaler・clip_grad_value_ の同期削減）には必須ではない
+    # ため、通常の (fused=False) AdamW に戻す。
     optim_g = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, net_g.parameters()),
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
-        fused=True,
     )
     optim_d = torch.optim.AdamW(
         net_d.parameters(),
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
-        fused=True,
     )
     if net_dur_disc is not None:
         optim_dur_disc = torch.optim.AdamW(
@@ -394,7 +398,6 @@ def run():
             hps.train.learning_rate,
             betas=hps.train.betas,
             eps=hps.train.eps,
-            fused=True,
         )
     else:
         optim_dur_disc = None
@@ -404,7 +407,6 @@ def run():
             hps.train.learning_rate,
             betas=hps.train.betas,
             eps=hps.train.eps,
-            fused=True,
         )
     else:
         optim_wd = None
