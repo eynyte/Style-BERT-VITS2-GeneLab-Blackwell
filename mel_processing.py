@@ -43,11 +43,11 @@ hann_window = {}
 
 
 def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False):
-    if torch.min(y) < -1.0:
-        print("min value is ", torch.min(y))
-    if torch.max(y) > 1.0:
-        print("max value is ", torch.max(y))
-
+    # NOTE: 元々ここに torch.min(y) < -1.0 / torch.max(y) > 1.0 のデバッグ用
+    # レンジチェックがあったが、GPU テンソルを Python の if 文で bool 評価すると
+    # 毎回 GPU→CPU 同期が発生する。この関数は学習ループの毎 step 呼ばれる
+    # ホットパスであり、正規化は上流 (audio / max_wav_value) で保証されている
+    # ため、常時同期を発生させるチェックは削除した。
     global hann_window
     dtype_device = str(y.dtype) + "_" + str(y.device)
     wnsize_dtype_device = str(win_size) + "_" + dtype_device
@@ -99,11 +99,9 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
 def mel_spectrogram_torch(
     y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False
 ):
-    if torch.min(y) < -1.0:
-        print("min value is ", torch.min(y))
-    if torch.max(y) > 1.0:
-        print("max value is ", torch.max(y))
-
+    # NOTE: spectrogram_torch と同様、学習ループから毎 step 呼ばれる
+    # (y_hat_mel の計算) ため、GPU→CPU 同期を伴うデバッグ用レンジチェックは
+    # 削除した。
     global mel_basis, hann_window
     dtype_device = str(y.dtype) + "_" + str(y.device)
     fmax_dtype_device = str(fmax) + "_" + dtype_device

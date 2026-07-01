@@ -27,7 +27,12 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     3) computes spectrograms from audio files.
     """
 
-    def __init__(self, audiopaths_sid_text: str, hparams: HyperParametersData):
+    def __init__(
+        self,
+        audiopaths_sid_text: str,
+        hparams: HyperParametersData,
+        cache_in_memory: bool = True,
+    ):
         self.audiopaths_sid_text = load_filepaths_and_text(audiopaths_sid_text)
         self.max_wav_value = hparams.max_wav_value
         self.sampling_rate = hparams.sampling_rate
@@ -50,6 +55,23 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.add_blank = hparams.add_blank
         self.min_text_len = getattr(hparams, "min_text_len", 1)
         self.max_text_len = getattr(hparams, "max_text_len", 384)
+
+        # NOTE: __getitem__ は毎 epoch 同じ index に対して呼ばれるが、
+        # 元の実装では毎回 scipy.io.wavfile.read / torch.load (.spec.pt,
+        # .bert.pt) / np.load (.npy) をディスク (or ページキャッシュ /
+        # tmpfs) から読み直し、Python 側でデコード・パースし直していた。
+        # ファイルの中身自体がメモリ上にあっても、この読み込み・パース
+        # 処理は CPU 時間を消費する。num_workers=1 固定の環境ではこの
+        # CPU 処理がそのままバッチ供給のボトルネックになりうるため、
+        # デコード済みテンソルをプロセス内メモリにキャッシュし、2 epoch 目
+        # 以降は再パースをスキップする。
+        # persistent_workers=True + num_workers=1 の構成では、この worker
+        # プロセスは学習中ずっと同じプロセスとして生き続けるため、
+        # インスタンス変数としてのキャッシュは epoch をまたいで有効に使える。
+        # メモリ使用量とのトレードオフになるため、必要であれば
+        # cache_in_memory=False で無効化できる。
+        self.cache_in_memory = cache_in_memory
+        self._cache: dict[int, tuple] = {}
 
         random.seed(1234)
         random.shuffle(self.audiopaths_sid_text)
@@ -196,7 +218,14 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         return sid
 
     def __getitem__(self, index):
-        return self.get_audio_text_speaker_pair(self.audiopaths_sid_text[index])
+        if self.cache_in_memory:
+            cached = self._cache.get(index)
+            if cached is not None:
+                return cached
+        item = self.get_audio_text_speaker_pair(self.audiopaths_sid_text[index])
+        if self.cache_in_memory:
+            self._cache[index] = item
+        return item
 
     def __len__(self):
         return len(self.audiopaths_sid_text)

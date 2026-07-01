@@ -1,5 +1,4 @@
 import argparse
-from contextlib import contextmanager
 import datetime
 import gc
 import os
@@ -43,13 +42,16 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = (
     True  # If encontered training problem,please try to disable TF32.
 )
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
 torch.set_num_threads(1)
 torch.set_float32_matmul_precision("medium")
-if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-torch.backends.cuda.sdp_kernel("flash")
+# NOTE: torch.backends.cuda.sdp_kernel(...) は本来 `with` 文で使うコンテキスト
+# マネージャで、ここのように単独で呼び出しても中身は何も実行されず、
+# 新しめの PyTorch では非推奨警告が出るだけの死んだコードだったため削除した。
+# なお、このモデルの Attention (style_bert_vits2/models/attentions.py) は
+# F.scaled_dot_product_attention を使わない手書き実装のため、以下の
+# enable_flash_sdp / enable_mem_efficient_sdp の設定も現状は効果を持たない
+# (SDPA バックエンドへの切り替え自体は今回のオーバーヘッド削減の範囲外
+# として見送っている)。
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(
     True
@@ -59,82 +61,6 @@ config = get_config()
 global_step = 0
 
 api = HfApi()
-
-
-def _get_train_num_workers() -> int:
-    requested = int(getattr(config.train_ms_config, "num_workers", 0) or 0)
-    if requested <= 0:
-        return 0
-    return min(requested, os.cpu_count() or requested)
-
-
-def _get_prefetch_factor(num_workers: int):
-    if num_workers <= 0:
-        return None
-    return max(1, int(os.environ.get("SBV2_PREFETCH_FACTOR", "4")))
-
-
-def _train_loader_kwargs(num_workers: int) -> dict:
-    kwargs = {
-        "num_workers": num_workers,
-        "pin_memory": True,
-    }
-    prefetch_factor = _get_prefetch_factor(num_workers)
-    if prefetch_factor is not None:
-        kwargs["persistent_workers"] = True
-        kwargs["prefetch_factor"] = prefetch_factor
-    return kwargs
-
-
-def _ddp_kwargs() -> dict:
-    kwargs = {
-        "broadcast_buffers": False,
-        "gradient_as_bucket_view": True,
-    }
-    return kwargs
-
-
-def _maybe_compile(module, name: str):
-    if os.environ.get("SBV2_TORCH_COMPILE", "0") != "1":
-        return module
-    if not hasattr(torch, "compile"):
-        logger.warning(f"torch.compile is not available; skipping compile for {name}.")
-        return module
-    mode = os.environ.get("SBV2_TORCH_COMPILE_MODE", "reduce-overhead")
-    try:
-        logger.info(f"Compiling {name} with torch.compile(mode={mode!r}).")
-        return torch.compile(module, mode=mode)
-    except Exception as e:
-        logger.warning(f"Failed to compile {name}; using eager mode. {e}")
-        return module
-
-
-def _cuda(tensor: torch.Tensor, local_rank: int, dtype=None) -> torch.Tensor:
-    kwargs = {
-        "device": torch.device("cuda", local_rank),
-        "non_blocking": True,
-    }
-    if dtype is not None:
-        kwargs["dtype"] = dtype
-    return tensor.to(**kwargs)
-
-
-@contextmanager
-def _temporarily_disable_grads(*modules):
-    states = []
-    for module in modules:
-        if module is None:
-            continue
-        params = list(module.parameters())
-        states.append((params, [p.requires_grad for p in params]))
-        for p in params:
-            p.requires_grad_(False)
-    try:
-        yield
-    finally:
-        for params, requires_grad_states in states:
-            for p, requires_grad in zip(params, requires_grad_states):
-                p.requires_grad_(requires_grad)
 
 
 def run():
@@ -301,14 +227,6 @@ def run():
         writer_eval = SummaryWriter(log_dir=os.path.join(model_dir, "eval"))
     train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
     collate_fn = TextAudioSpeakerCollate(use_jp_extra=True)
-    train_num_workers = _get_train_num_workers()
-    train_loader_kwargs = _train_loader_kwargs(train_num_workers)
-    logger.info(
-        "DataLoader settings: "
-        f"num_workers={train_num_workers}, "
-        f"prefetch_factor={train_loader_kwargs.get('prefetch_factor')}, "
-        f"persistent_workers={train_loader_kwargs.get('persistent_workers', False)}"
-    )
     if not args.not_use_custom_batch_sampler:
         train_sampler = DistributedBucketSampler(
             train_dataset,
@@ -320,11 +238,17 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            **train_loader_kwargs,
+            # メモリ消費量を減らそうとnum_workersを1にしてみる
+            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
+            num_workers=1,
             shuffle=False,
+            pin_memory=True,
             collate_fn=collate_fn,
             batch_sampler=train_sampler,
             # batch_size=hps.train.batch_size,
+            persistent_workers=True,
+            # これもメモリ消費量を減らそうとしてコメントアウト
+            # prefetch_factor=6,
         )
     else:
         train_sampler = DistributedLengthGroupedSampler(
@@ -337,11 +261,17 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            **train_loader_kwargs,
+            # メモリ消費量を減らそうとnum_workersを1にしてみる
+            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
+            num_workers=1,
             # shuffle=True,
+            pin_memory=True,
             collate_fn=collate_fn,
             sampler=train_sampler,
             batch_size=hps.train.batch_size,
+            persistent_workers=True,
+            # これもメモリ消費量を減らそうとしてコメントアウト
+            # prefetch_factor=6,
         )
         logger.info("Using DistributedLengthGroupedSampler for training.")
         logger.debug(f"len(train_dataset): {len(train_dataset)}")
@@ -438,65 +368,66 @@ def run():
         for param in net_g.dec.parameters():
             param.requires_grad = False
 
-    net_g = _maybe_compile(net_g, "net_g")
     net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(local_rank)
-    net_d = _maybe_compile(net_d, "net_d")
+    # NOTE: fused=True にすると、パラメータテンソル毎に個別のカーネルを
+    # 起動する代わりに、Adam の更新を 1 回の fused multi-tensor カーネルに
+    # まとめて実行する。net_g のようにパラメータ数が多いモデルでは、
+    # optimizer.step() 呼び出し毎の CPU 側のカーネル起動オーバーヘッドが
+    # 大きく減る。全パラメータが CUDA 上にあるため安全に有効化できる。
     optim_g = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, net_g.parameters()),
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
+        fused=True,
     )
     optim_d = torch.optim.AdamW(
         net_d.parameters(),
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
+        fused=True,
     )
     if net_dur_disc is not None:
-        net_dur_disc = _maybe_compile(net_dur_disc, "net_dur_disc")
         optim_dur_disc = torch.optim.AdamW(
             net_dur_disc.parameters(),
             hps.train.learning_rate,
             betas=hps.train.betas,
             eps=hps.train.eps,
+            fused=True,
         )
     else:
         optim_dur_disc = None
     if net_wd is not None:
-        net_wd = _maybe_compile(net_wd, "net_wd")
         optim_wd = torch.optim.AdamW(
             net_wd.parameters(),
             hps.train.learning_rate,
             betas=hps.train.betas,
             eps=hps.train.eps,
+            fused=True,
         )
     else:
         optim_wd = None
     net_g = DDP(
         net_g,
         device_ids=[local_rank],
-        **_ddp_kwargs(),
         # bucket_cap_mb=512
     )
     net_d = DDP(
         net_d,
         device_ids=[local_rank],
-        **_ddp_kwargs(),
         # bucket_cap_mb=512
     )
     if net_dur_disc is not None:
         net_dur_disc = DDP(
             net_dur_disc,
             device_ids=[local_rank],
-            **_ddp_kwargs(),
             # bucket_cap_mb=512,
         )
     if net_wd is not None:
         net_wd = DDP(
             net_wd,
             device_ids=[local_rank],
-            **_ddp_kwargs(),
             #  bucket_cap_mb=512
         )
 
@@ -634,6 +565,24 @@ def run():
     else:
         scheduler_wd = None
         wl = None
+    # NOTE: このファイルの autocast は常に dtype=torch.bfloat16 で使われている
+    # (fp16 の経路は存在しない)。bf16 は fp32 と同じ指数部の広さを持つため、
+    # fp16 のような勾配アンダーフロー/オーバーフロー対策としてのロス
+    # スケーリングは本質的に不要。
+    #
+    # にもかかわらず元のコードは `GradScaler(enabled=hps.train.bf16_run)` と
+    # なっており、bf16 学習時 (=hps.train.bf16_run=True) に GradScaler が
+    # 有効化されていた。GradScaler が有効な場合、scaler.step(optimizer) の
+    # 内部で inf/nan チェック結果を `.item()` で読み出すため、呼び出す
+    # 都度 GPU→CPU の同期が発生する (1 step あたり optim_g / optim_d /
+    # optim_dur_disc / optim_wd で最大 4 回)。GPU 側の計算が速いほど、
+    # この同期待ちがステップ時間に占める割合が大きくなり GPU 使用率が
+    # 下がる — RTX PRO 6000 (85%) より B200 (65%) の方が使用率が低い、
+    # という報告はこれと整合する。
+    #
+    # ここでは enabled=False に固定し、scaler.scale()/unscale_()/step()/
+    # update() は全て同期なしの薄いパススルーとして動作するようにする
+    # (挙動はそのまま維持しつつ、不要な同期のみを取り除く)。
     scaler = GradScaler(enabled=False)
     logger.info("Start training.")
 
@@ -791,12 +740,6 @@ def train_and_evaluate(
         net_dur_disc.train()
     if net_wd is not None:
         net_wd.train()
-    feature_input_dtype = (
-        torch.bfloat16
-        if getattr(hps.train, "bf16_run", False)
-        and os.environ.get("SBV2_BF16_FEATURE_INPUTS", "1") != "0"
-        else None
-    )
     for batch_idx, (
         x,
         x_lengths,
@@ -810,25 +753,26 @@ def train_and_evaluate(
         bert,
         style_vec,
     ) in enumerate(train_loader):
-        should_log = (
-            rank == 0
-            and global_step % hps.train.log_interval == 0
-            and not hps.speedup
-        )
         if net_g.module.use_noise_scaled_mas:
             current_mas_noise_scale = (
                 net_g.module.mas_noise_scale_initial
                 - net_g.module.noise_scale_delta * global_step
             )
             net_g.module.current_mas_noise_scale = max(current_mas_noise_scale, 0.0)
-        x, x_lengths = _cuda(x, local_rank), _cuda(x_lengths, local_rank)
-        spec, spec_lengths = _cuda(spec, local_rank), _cuda(spec_lengths, local_rank)
-        y, y_lengths = _cuda(y, local_rank), _cuda(y_lengths, local_rank)
-        speakers = _cuda(speakers, local_rank)
-        tone = _cuda(tone, local_rank)
-        language = _cuda(language, local_rank)
-        bert = _cuda(bert, local_rank, dtype=feature_input_dtype)
-        style_vec = _cuda(style_vec, local_rank, dtype=feature_input_dtype)
+        x, x_lengths = x.cuda(local_rank, non_blocking=True), x_lengths.cuda(
+            local_rank, non_blocking=True
+        )
+        spec, spec_lengths = spec.cuda(
+            local_rank, non_blocking=True
+        ), spec_lengths.cuda(local_rank, non_blocking=True)
+        y, y_lengths = y.cuda(local_rank, non_blocking=True), y_lengths.cuda(
+            local_rank, non_blocking=True
+        )
+        speakers = speakers.cuda(local_rank, non_blocking=True)
+        tone = tone.cuda(local_rank, non_blocking=True)
+        language = language.cuda(local_rank, non_blocking=True)
+        bert = bert.cuda(local_rank, non_blocking=True)
+        style_vec = style_vec.cuda(local_rank, non_blocking=True)
 
         with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
             (
@@ -901,16 +845,14 @@ def train_and_evaluate(
                         losses_dur_disc_g,
                     ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
                     loss_dur_disc_all = loss_dur_disc
-                optim_dur_disc.zero_grad(set_to_none=True)
+                optim_dur_disc.zero_grad()
                 scaler.scale(loss_dur_disc_all).backward()
                 scaler.unscale_(optim_dur_disc)
                 # torch.nn.utils.clip_grad_norm_(
                 # parameters=net_dur_disc.parameters(), max_norm=5
                 # )
-                grad_norm_dur = (
-                    commons.clip_grad_value_(net_dur_disc.parameters(), None)
-                    if should_log
-                    else 0.0
+                grad_norm_dur = commons.clip_grad_value_(
+                    net_dur_disc.parameters(), None
                 )
                 scaler.step(optim_dur_disc)
             if net_wd is not None:
@@ -921,63 +863,59 @@ def train_and_evaluate(
                         y.detach().squeeze(1), y_hat.detach().squeeze(1)
                     ).mean()
 
-                optim_wd.zero_grad(set_to_none=True)
+                optim_wd.zero_grad()
                 scaler.scale(loss_slm).backward()
                 scaler.unscale_(optim_wd)
                 # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
-                grad_norm_wd = (
-                    commons.clip_grad_value_(net_wd.parameters(), None)
-                    if should_log
-                    else 0.0
-                )
+                grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
                 scaler.step(optim_wd)
 
-        optim_d.zero_grad(set_to_none=True)
+        optim_d.zero_grad()
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
+        # NOTE: 元は bf16_run=True のとき torch.nn.utils.clip_grad_norm_ で
+        # クリップ・ノルム計算をした直後に、ログ用の grad_norm_d を得るためだけに
+        # commons.clip_grad_value_(..., None) で全パラメータのノルムを
+        # もう一度計算し直していた（全パラメータに対する二重の走査）。
+        # clip_grad_norm_ は総ノルムを返り値として返すので、それをそのまま使う。
         if getattr(hps.train, "bf16_run", False):
             grad_norm_d = torch.nn.utils.clip_grad_norm_(
                 parameters=net_d.parameters(), max_norm=200
             )
         else:
-            grad_norm_d = (
-                commons.clip_grad_value_(net_d.parameters(), None)
-                if should_log
-                else 0.0
-            )
+            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
         scaler.step(optim_d)
 
-        with _temporarily_disable_grads(net_d, net_dur_disc, net_wd):
+        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+            # Generator
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+            if net_dur_disc is not None:
+                _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+            if net_wd is not None:
+                loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
+                loss_lm_gen = wl.generator(y_hat.squeeze(1))
             with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                # Generator
-                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+                loss_dur = torch.sum(l_length.float())
+                loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+
+                loss_fm = feature_loss(fmap_r, fmap_g)
+                loss_gen, losses_gen = generator_loss(y_d_hat_g)
+                # loss_commit = loss_commit * hps.train.c_commit
+
+                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
                 if net_dur_disc is not None:
-                    _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
-                if net_wd is not None:
-                    loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
-                    loss_lm_gen = wl.generator(y_hat.squeeze(1))
-                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                    loss_dur = torch.sum(l_length.float())
-                    loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                    loss_kl = (
-                        kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-                    )
-
-                    loss_fm = feature_loss(fmap_r, fmap_g)
-                    loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                    # loss_commit = loss_commit * hps.train.c_commit
-
-                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-                    if net_dur_disc is not None:
-                        loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-                        if net_wd is not None:
-                            loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
-                        else:
-                            loss_gen_all += loss_dur_gen
-        optim_g.zero_grad(set_to_none=True)
+                    loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
+                    if net_wd is not None:
+                        loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
+                    else:
+                        loss_gen_all += loss_dur_gen
+        optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
-        # if getattr(hps.train, "bf16_run", False):
+        # NOTE: net_d と同様、clip_grad_norm_ の返り値（総ノルム）を
+        # そのまま grad_norm_g として使い、commons.clip_grad_value_ による
+        # 全パラメータの二重走査を無くす。
         grad_norm_g = torch.nn.utils.clip_grad_norm_(
             parameters=net_g.parameters(), max_norm=500
         )
@@ -985,7 +923,7 @@ def train_and_evaluate(
         scaler.update()
 
         if rank == 0:
-            if should_log:
+            if global_step % hps.train.log_interval == 0 and not hps.speedup:
                 lr = optim_g.param_groups[0]["lr"]
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 # logger.info(

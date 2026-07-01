@@ -15,6 +15,11 @@ def feature_loss(fmap_r, fmap_g):
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    # NOTE: r_losses/g_losses はロギング（TensorBoard 表示）専用に使われる値だが、
+    # 元の実装では毎 step 無条件に .item() を呼んでおり、サブ判別器の数だけ
+    # （MultiPeriodDiscriminator なら period 5 種 + scale 1 種 = 6 個 × 2 = 12 回/step）
+    # GPU→CPU の同期が発生していた。ここではテンソルのまま返し、実際に
+    # ログへ書き込む（log_interval ごと）タイミングまで同期を遅延させる。
     loss = 0
     r_losses = []
     g_losses = []
@@ -24,8 +29,8 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
         r_loss = torch.mean((1 - dr) ** 2)
         g_loss = torch.mean(dg**2)
         loss += r_loss + g_loss
-        r_losses.append(r_loss.detach())
-        g_losses.append(g_loss.detach())
+        r_losses.append(r_loss)
+        g_losses.append(g_loss)
 
     return loss, r_losses, g_losses
 
