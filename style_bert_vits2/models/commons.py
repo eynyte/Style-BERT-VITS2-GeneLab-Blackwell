@@ -9,6 +9,51 @@ import torch
 from torch.nn import functional as F
 
 
+def make_adamw_optimizer(
+    parameters: Any,
+    lr: float,
+    betas: tuple[float, float],
+    eps: float,
+) -> torch.optim.AdamW:
+    """
+    可能なら fused AdamW（パラメータ更新を融合した CUDA カーネルで行う実装）を
+    使って AdamW オプティマイザを作成する。
+
+    fused=True は通常の（foreach/単純ループの）AdamW と数学的に同一の更新式を
+    使う PyTorch 公式の実装であり、学習結果を変えるものではない。パラメータ数
+    だけ小さな更新カーネルを個別に起動する代わりに融合したカーネルで処理する
+    ため、特にパラメータ数の多いネットワーク（net_g 等）でカーネル起動
+    オーバーヘッドを削減できる（＝GPU 使用率の向上に寄与する）。GradScaler は
+    fused optimizer を認識して正しく扱えるため、`scaler.unscale_()` を明示的に
+    呼んでから `scaler.step()` する既存フローともそのまま組み合わせられる。
+
+    PyTorch バージョンや環境によっては fused がサポートされない可能性がある
+    ため、実際に小さなダミーパラメータで動作確認できた場合のみ使用し、
+    だめであれば黙って通常の実装にフォールバックする（学習が落ちないことを
+    優先する）。
+    """
+    parameters = list(parameters)
+    fused_available = False
+    if len(parameters) > 0 and parameters[0].is_cuda:
+        try:
+            probe = torch.nn.Parameter(
+                torch.zeros(1, device=parameters[0].device, dtype=torch.float32)
+            )
+            probe.grad = torch.zeros_like(probe)
+            torch.optim.AdamW(
+                [probe], lr=lr, betas=betas, eps=eps, fused=True
+            ).step()
+            fused_available = True
+        except Exception:
+            fused_available = False
+    if fused_available:
+        try:
+            return torch.optim.AdamW(parameters, lr, betas=betas, eps=eps, fused=True)
+        except Exception:
+            pass
+    return torch.optim.AdamW(parameters, lr, betas=betas, eps=eps)
+
+
 def init_weights(m: torch.nn.Module, mean: float = 0.0, std: float = 0.01) -> None:
     """
     モジュールの重みを初期化する
@@ -20,8 +65,7 @@ def init_weights(m: torch.nn.Module, mean: float = 0.0, std: float = 0.01) -> No
     """
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
-        with torch.no_grad():
-            m.weight.normal_(mean, std)
+        m.weight.data.normal_(mean, std)
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -83,10 +127,9 @@ def slice_segments(
     Returns:
         torch.Tensor: スライスされたセグメント
     """
-    gather_indices = ids_str.view(x.size(0), 1, 1) + torch.arange(
-        segment_size, device=x.device
-    ).view(1, 1, -1)
-    gather_indices = gather_indices.expand(-1, x.size(1), -1)
+    gather_indices = ids_str.view(x.size(0), 1, 1).repeat(
+        1, x.size(1), 1
+    ) + torch.arange(segment_size, device=x.device)
     return torch.gather(x, 2, gather_indices)
 
 
@@ -104,25 +147,16 @@ def rand_slice_segments(
     Returns:
         tuple[torch.Tensor, torch.Tensor]: スライスされたセグメントと開始インデックス
     """
-    b, _, t = x.size()
+    b, d, t = x.size()
     if x_lengths is None:
-        ids_str_max = torch.full(
-            (b,), max(t - segment_size + 1, 0), dtype=torch.long, device=x.device
-        )
-    else:
-        ids_str_max = torch.clamp(x_lengths - segment_size + 1, min=0)
-    ids_str = (
-        torch.rand(b, device=x.device) * ids_str_max.to(dtype=torch.float32)
-    ).to(dtype=torch.long)
+        x_lengths = t  # type: ignore
+    ids_str_max = torch.clamp(x_lengths - segment_size + 1, min=0)  # type: ignore
+    ids_str = (torch.rand([b], device=x.device) * ids_str_max).to(dtype=torch.long)
     ret = slice_segments(x, ids_str, segment_size)
     return ret, ids_str
 
 
-def subsequent_mask(
-    length: int,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
+def subsequent_mask(length: int) -> torch.Tensor:
     """
     後続のマスクを生成する
 
@@ -132,14 +166,7 @@ def subsequent_mask(
     Returns:
         torch.Tensor: 生成されたマスク
     """
-    mask = torch.tril(
-        torch.ones(
-            length,
-            length,
-            device=device,
-            dtype=dtype if dtype is not None else torch.float32,
-        )
-    ).unsqueeze(0).unsqueeze(0)
+    mask = torch.tril(torch.ones(length, length)).unsqueeze(0).unsqueeze(0)
     return mask
 
 
@@ -202,7 +229,7 @@ def generate_path(duration: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     cum_duration_flat = cum_duration.view(b * t_x)
     path = sequence_mask(cum_duration_flat, t_y).to(mask.dtype)
     path = path.view(b, t_x, t_y)
-    path = path - F.pad(path, (0, 0, 1, 0, 0, 0))[:, :-1]
+    path = path - F.pad(path, convert_pad_shape([[0, 0], [1, 0], [0, 0]]))[:, :-1]
     path = path.unsqueeze(1).transpose(2, 3) * mask
     return path
 
@@ -211,7 +238,7 @@ def clip_grad_value_(
     parameters: Union[torch.Tensor, list[torch.Tensor]],
     clip_value: Optional[float],
     norm_type: float = 2.0,
-) -> Union[float, torch.Tensor]:
+) -> float:
     """
     勾配の値をクリップする
 
@@ -222,45 +249,49 @@ def clip_grad_value_(
 
     Returns:
         float: 総ノルム
+
+    Note:
+        元実装はパラメータ数だけ Python ループを回し、`.item()` を1テンソルずつ
+        呼び出していたため、そのたびに GPU-CPU 間の同期が発生していた（ネットワーク
+        1つあたり数百回になることもある）。特にステップ時間の短い高速な GPU では、
+        この同期待ちがボトルネックになりやすい。
+        `torch._foreach_norm` / `torch._foreach_clamp_*` を使い、同期を関数全体で
+        高々1回（`.item()` 1回）に削減する。値は元実装と数学的に同一（クランプ処理は
+        bit-exact、ノルムは元実装が Python の float（=倍精度）で累積していたのに
+        合わせて倍精度で合算するため、実用上 bit-exact 相当）。
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    grads = [p.grad.detach() for p in parameters if p.grad is not None]
+    parameters = [p for p in parameters if p.grad is not None]
     norm_type = float(norm_type)
-    if clip_value is not None:
-        clip_value = float(clip_value)
-
-    if len(grads) == 0:
+    if len(parameters) == 0:
         return 0.0
 
-    first_device = grads[0].device
-    same_device = all(grad.device == first_device for grad in grads)
-
-    if same_device:
-        if hasattr(torch, "_foreach_norm"):
-            try:
-                norms = torch._foreach_norm(grads, norm_type)
-            except (RuntimeError, TypeError):
-                norms = [torch.linalg.vector_norm(grad, ord=norm_type) for grad in grads]
-        else:
-            norms = [torch.linalg.vector_norm(grad, ord=norm_type) for grad in grads]
-        norms = [norm.to(device=first_device, dtype=torch.float32) for norm in norms]
-        total_norm = torch.linalg.vector_norm(torch.stack(norms), ord=norm_type)
-    else:
-        total_norm = 0.0
-        for grad in grads:
-            total_norm += grad.norm(norm_type).item() ** norm_type
-        total_norm = total_norm ** (1.0 / norm_type)
+    grads = [p.grad for p in parameters]
 
     if clip_value is not None:
-        if same_device and hasattr(torch, "_foreach_clamp_"):
-            try:
-                torch._foreach_clamp_(grads, min=-clip_value, max=clip_value)
-            except (RuntimeError, TypeError):
-                for grad in grads:
-                    grad.clamp_(min=-clip_value, max=clip_value)
-        else:
-            for grad in grads:
-                grad.clamp_(min=-clip_value, max=clip_value)
+        clip_value = float(clip_value)
+        # p.grad.data.clamp_(min=-clip_value, max=clip_value) と bit-exact
+        torch._foreach_clamp_min_(grads, -clip_value)
+        torch._foreach_clamp_max_(grads, clip_value)
 
-    return total_norm
+    if norm_type == float("inf"):
+        per_tensor_norms = [g.detach().abs().max() for g in grads]
+        total_norm = torch.stack(per_tensor_norms).max().double()
+    else:
+        # torch._foreach_norm は device/dtype が揃ったテンソル群でのみ動作するため、
+        # 念のためグルーピングしてから呼び出す（通常このリポジトリでは全て同一
+        # device/dtype の float32 なので、実際には1グループにまとまる）。
+        groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+        for g in grads:
+            groups.setdefault((g.device, g.dtype), []).append(g)
+        per_tensor_norms = []
+        for group_grads in groups.values():
+            per_tensor_norms.extend(torch._foreach_norm(group_grads, norm_type))
+        # 倍精度で合算することで、元実装（Python float = 倍精度で累積）と
+        # 同じ丸め誤差になるようにする。
+        stacked = torch.stack([n.double() for n in per_tensor_norms])
+        total_norm = stacked.pow(norm_type).sum().pow(1.0 / norm_type)
+
+    # ここで初めて（関数全体で1回だけ）GPU-CPU 同期が発生する。
+    return total_norm.item()
