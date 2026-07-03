@@ -27,7 +27,6 @@ from losses import WavLMLoss, discriminator_loss, feature_loss, generator_loss, 
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models import commons, utils
-from style_bert_vits2.models.commons import make_adamw_optimizer
 from style_bert_vits2.models.hyper_parameters import HyperParameters
 from style_bert_vits2.models.models_jp_extra import (
     DurationDiscriminator,
@@ -363,20 +362,20 @@ def run():
             param.requires_grad = False
 
     net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(local_rank)
-    optim_g = make_adamw_optimizer(
+    optim_g = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, net_g.parameters()),
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
     )
-    optim_d = make_adamw_optimizer(
+    optim_d = torch.optim.AdamW(
         net_d.parameters(),
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
     )
     if net_dur_disc is not None:
-        optim_dur_disc = make_adamw_optimizer(
+        optim_dur_disc = torch.optim.AdamW(
             net_dur_disc.parameters(),
             hps.train.learning_rate,
             betas=hps.train.betas,
@@ -385,7 +384,7 @@ def run():
     else:
         optim_dur_disc = None
     if net_wd is not None:
-        optim_wd = make_adamw_optimizer(
+        optim_wd = torch.optim.AdamW(
             net_wd.parameters(),
             hps.train.learning_rate,
             betas=hps.train.betas,
