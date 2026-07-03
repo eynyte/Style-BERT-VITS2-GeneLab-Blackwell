@@ -43,11 +43,10 @@ hann_window = {}
 
 
 def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False):
-    if torch.min(y) < -1.0:
-        print("min value is ", torch.min(y))
-    if torch.max(y) > 1.0:
-        print("max value is ", torch.max(y))
-
+    # 元々ここにあった `if torch.min(y) < -1.0: print(...)` / `torch.max(y) > 1.0` の
+    # デバッグ用チェックは、Python の if 文でテンソルの真偽値を評価するために毎回
+    # GPU-CPU 同期を強制していた（計算結果には一切影響しない print のみの処理）。
+    # 学習のホットパスから呼ばれるため削除し、同期待ちを無くす。
     global hann_window
     dtype_device = str(y.dtype) + "_" + str(y.device)
     wnsize_dtype_device = str(win_size) + "_" + dtype_device
@@ -99,11 +98,9 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
 def mel_spectrogram_torch(
     y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False
 ):
-    if torch.min(y) < -1.0:
-        print("min value is ", torch.min(y))
-    if torch.max(y) > 1.0:
-        print("max value is ", torch.max(y))
-
+    # spectrogram_torch と同様の理由でデバッグ用の min/max チェックを削除。
+    # この関数は学習ループで毎ステップ呼ばれる（y_hat_mel の計算）ため、
+    # 同期コストの影響がより大きい。
     global mel_basis, hann_window
     dtype_device = str(y.dtype) + "_" + str(y.device)
     fmax_dtype_device = str(fmax) + "_" + dtype_device

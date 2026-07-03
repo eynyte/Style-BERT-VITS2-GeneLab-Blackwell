@@ -129,7 +129,14 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         if self.use_mel_spec_posterior:
             spec_filename = spec_filename.replace(".spec.pt", ".mel.pt")
         try:
-            spec = torch.load(spec_filename)
+            # weights_only=True はフルの pickle 経由ではなく制限された高速な
+            # デシリアライズ経路を使うため、（プレーンな Tensor を保存している
+            # 前提の）このキャッシュ読み込みが速くなる。num_workers=1 に固定
+            # されている（＝データ読み込みが単一プロセスに集中する）ため、
+            # 1 サンプルあたりの読み込みコストを下げることが直接効いてくる。
+            # 値そのものは変わらない（万一失敗しても、下の except でこれまで
+            # 通りスペクトログラムを再計算するだけなので安全）。
+            spec = torch.load(spec_filename, map_location="cpu", weights_only=True)
         except:
             if self.use_mel_spec_posterior:
                 spec = mel_spectrogram_torch(
@@ -168,7 +175,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             word2ph[0] += 1
         bert_path = wav_path.replace(".wav", ".bert.pt")
         try:
-            bert_ori = torch.load(bert_path)
+            # 理由は get_audio() 内の spec 読み込みと同様（高速なデシリアライズ
+            # 経路を使う）。失敗時は下の except で従来通り警告のみ。
+            bert_ori = torch.load(bert_path, map_location="cpu", weights_only=True)
             assert bert_ori.shape[-1] == len(phone)
         except Exception as e:
             logger.warning("Bert load Failed")

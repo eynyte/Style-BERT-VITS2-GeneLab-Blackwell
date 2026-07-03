@@ -15,6 +15,12 @@ def feature_loss(fmap_r, fmap_g):
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    # 元実装は r_loss / g_loss を sub-discriminator の数だけ .item() していたため、
+    # 呼び出すたびに GPU-CPU 同期が何度も発生していた（実際に学習へ使われるのは
+    # 加算後の `loss` テンソルのみで、r_losses / g_losses はログ表示専用）。
+    # generator_loss() と同様に detach 済みテンソルのまま返し、同期は実際に
+    # ログへ書き出す（TensorBoard 側で .item() 相当の変換が起きる）タイミングまで
+    # 遅延させる。数値自体は変わらない。
     loss = 0
     r_losses = []
     g_losses = []
