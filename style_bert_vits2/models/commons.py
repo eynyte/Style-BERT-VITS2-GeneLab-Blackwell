@@ -9,51 +9,6 @@ import torch
 from torch.nn import functional as F
 
 
-def make_adamw_optimizer(
-    parameters: Any,
-    lr: float,
-    betas: tuple[float, float],
-    eps: float,
-) -> torch.optim.AdamW:
-    """
-    可能なら fused AdamW（パラメータ更新を融合した CUDA カーネルで行う実装）を
-    使って AdamW オプティマイザを作成する。
-
-    fused=True は通常の（foreach/単純ループの）AdamW と数学的に同一の更新式を
-    使う PyTorch 公式の実装であり、学習結果を変えるものではない。パラメータ数
-    だけ小さな更新カーネルを個別に起動する代わりに融合したカーネルで処理する
-    ため、特にパラメータ数の多いネットワーク（net_g 等）でカーネル起動
-    オーバーヘッドを削減できる（＝GPU 使用率の向上に寄与する）。GradScaler は
-    fused optimizer を認識して正しく扱えるため、`scaler.unscale_()` を明示的に
-    呼んでから `scaler.step()` する既存フローともそのまま組み合わせられる。
-
-    PyTorch バージョンや環境によっては fused がサポートされない可能性がある
-    ため、実際に小さなダミーパラメータで動作確認できた場合のみ使用し、
-    だめであれば黙って通常の実装にフォールバックする（学習が落ちないことを
-    優先する）。
-    """
-    parameters = list(parameters)
-    fused_available = False
-    if len(parameters) > 0 and parameters[0].is_cuda:
-        try:
-            probe = torch.nn.Parameter(
-                torch.zeros(1, device=parameters[0].device, dtype=torch.float32)
-            )
-            probe.grad = torch.zeros_like(probe)
-            torch.optim.AdamW(
-                [probe], lr=lr, betas=betas, eps=eps, fused=True
-            ).step()
-            fused_available = True
-        except Exception:
-            fused_available = False
-    if fused_available:
-        try:
-            return torch.optim.AdamW(parameters, lr, betas=betas, eps=eps, fused=True)
-        except Exception:
-            pass
-    return torch.optim.AdamW(parameters, lr, betas=betas, eps=eps)
-
-
 def init_weights(m: torch.nn.Module, mean: float = 0.0, std: float = 0.01) -> None:
     """
     モジュールの重みを初期化する
