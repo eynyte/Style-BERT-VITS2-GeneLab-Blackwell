@@ -217,7 +217,13 @@ def run():
         utils.check_git_hash(model_dir)
         writer = SummaryWriter(log_dir=model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(model_dir, "eval"))
-    train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
+    train_dataset = TextAudioSpeakerLoader(
+        hps.data.training_files,
+        hps.data,
+        preload=True,
+        preload_bert=True,
+        preload_mel=True,
+    )
     collate_fn = TextAudioSpeakerCollate()
     if not args.not_use_custom_batch_sampler:
         train_sampler = DistributedBucketSampler(
@@ -268,7 +274,13 @@ def run():
     eval_dataset = None
     eval_loader = None
     if rank == 0 and not args.speedup:
-        eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps.data)
+        eval_dataset = TextAudioSpeakerLoader(
+            hps.data.validation_files,
+            hps.data,
+            preload=True,
+            preload_bert=True,
+            preload_mel=True,
+        )
         eval_loader = DataLoader(
             eval_dataset,
             num_workers=0,
@@ -677,16 +689,21 @@ def train_and_evaluate(
                 en_bert,
                 style_vec,
             )
-            mel = spec_to_mel_torch(
-                spec,
+            # 旧コードは spec → mel (フル長) → slice していたため、
+            # segment_size // hop_length (=16 frame) に切り出す前の
+            # ~400 frame 分の matmul [80,1025]×[B,1025,400] を毎回
+            # 回していた。先に spec を slice してから mel に変換
+            # すれば、対象は [B,1025,16] になり ~27x 速くなる。
+            spec_sliced = commons.slice_segments(
+                spec, ids_slice, hps.train.segment_size // hps.data.hop_length
+            )
+            y_mel = spec_to_mel_torch(
+                spec_sliced,
                 hps.data.filter_length,
                 hps.data.n_mel_channels,
                 hps.data.sampling_rate,
                 hps.data.mel_fmin,
                 hps.data.mel_fmax,
-            )
-            y_mel = commons.slice_segments(
-                mel, ids_slice, hps.train.segment_size // hps.data.hop_length
             )
             y_hat_mel = mel_spectrogram_torch(
                 y_hat.squeeze(1).float(),

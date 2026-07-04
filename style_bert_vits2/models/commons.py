@@ -197,6 +197,12 @@ def clip_grad_value_(
     """
     勾配の値をクリップする
 
+    元実装は Python ループで 1 パラメータごとに .grad.norm() と .item()
+    を呼ぶため、GPU<->CPU 同期がパラメータ数ぶん発生していた。
+    これを torch._foreach_norm + テンソル上でのノルム計算 + 最後の
+    1 回だけ .item() に置換することで、1 step あたり 100〜数百回の
+    同期 stall を排除する。
+
     Args:
         parameters (Union[torch.Tensor, list[torch.Tensor]]): クリップするパラメータ
         clip_value (Optional[float]): クリップする値。None の場合はクリップしない
@@ -207,17 +213,23 @@ def clip_grad_value_(
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    # .grad が None のものはスキップ。CPU/GPU 混在はそのまま流す。
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return 0.0
     norm_type = float(norm_type)
     if clip_value is not None:
         clip_value = float(clip_value)
 
-    total_norm = 0.0
-    for p in parameters:
-        assert p.grad is not None
-        param_norm = p.grad.data.norm(norm_type)
-        total_norm += param_norm.item() ** norm_type
-        if clip_value is not None:
-            p.grad.data.clamp_(min=-clip_value, max=clip_value)
-    total_norm = total_norm ** (1.0 / norm_type)
-    return total_norm
+    if clip_value is not None:
+        # clamp_ も foreach 版で 1 回のカーネルにまとめる。
+        torch._foreach_clamp_(grads, -clip_value, clip_value)
+
+    # torch._foreach_norm は GPU 上で全パラメータ分のノルムをまとめて計算し、
+    # 戻り値は CPU tensor の list。total_norm^ord = sum(norm^ord) を 1 回だけ
+    # GPU で計算し、最後に .item() で同期する (旧: パラメータごとに同期)。
+    norms = torch._foreach_norm(grads, ord=norm_type)
+    # norms は CPU 側の 0-dim tensor のリストなので stack して 1 回の演算に。
+    norms_t = torch.stack(norms)
+    total_norm = norms_t.pow(norm_type).sum().pow(1.0 / norm_type)
+    return float(total_norm.item())

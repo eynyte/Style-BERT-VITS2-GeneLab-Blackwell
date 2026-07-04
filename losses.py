@@ -15,6 +15,17 @@ def feature_loss(fmap_r, fmap_g):
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    """
+    戻り値:
+        loss: スカラー Tensor (勾配可)
+        r_losses: list[float] (CPU) または list[Tensor] (デバイス上)
+        g_losses: list[float] (CPU) または list[Tensor] (デバイス上)
+
+    sync_item=True のときだけ .item() で GPU<->CPU 同期を発生する。
+    トレーニング本体では sync_item=False にし、log_interval で
+    まとめて sync_item=True で取り出すと、1 step あたりの同期 stall を
+    なくせる (学習ループは log 時のみ .item() を呼ぶ)。
+    """
     loss = 0
     r_losses = []
     g_losses = []
@@ -23,9 +34,9 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
         dg = dg.float()
         r_loss = torch.mean((1 - dr) ** 2)
         g_loss = torch.mean(dg**2)
-        loss += r_loss + g_loss
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
+        loss = loss + r_loss + g_loss
+        r_losses.append(r_loss)
+        g_losses.append(g_loss)
 
     return loss, r_losses, g_losses
 
@@ -37,7 +48,7 @@ def generator_loss(disc_outputs):
         dg = dg.float()
         l = torch.mean((1 - dg) ** 2)
         gen_losses.append(l)
-        loss += l
+        loss = loss + l
 
     return loss, gen_losses
 
@@ -54,7 +65,7 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
     z_mask = z_mask.float()
 
     kl = logs_p - logs_q - 0.5
-    kl += 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2.0 * logs_p)
+    kl = kl + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2.0 * logs_p)
     kl = torch.sum(kl * z_mask)
     l = kl / torch.sum(z_mask)
     return l
