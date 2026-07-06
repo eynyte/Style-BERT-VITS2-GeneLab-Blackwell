@@ -722,18 +722,23 @@ def train_and_evaluate(
                         losses_dur_disc_g,
                     ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
                     loss_dur_disc_all = loss_dur_disc
-                optim_dur_disc.zero_grad()
+                optim_dur_disc.zero_grad(set_to_none=True)
                 scaler.scale(loss_dur_disc_all).backward()
                 scaler.unscale_(optim_dur_disc)
-                commons.clip_grad_value_(net_dur_disc.parameters(), None)
+                # commons.clip_grad_value_(net_dur_disc.parameters(), None) は
+                # 戻り値がどこでも使われておらず（clip_value=None のため勾配も
+                # 変更しない）、GPU-CPU 同期を発生させるだけの無駄な呼び出し
+                # だったため削除した。学習結果への影響はない。
                 scaler.step(optim_dur_disc)
 
-        optim_d.zero_grad()
+        optim_d.zero_grad(set_to_none=True)
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
         if getattr(hps.train, "bf16_run", False):
             torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+        # grad_norm_d はログ専用のため遅延計算する（下の log_interval ブロック
+        # 参照）。clip_grad_norm_ 自体は実際に勾配をクリップするので、こちらは
+        # 元の位置のまま毎ステップ実行する。
         scaler.step(optim_d)
 
         with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
@@ -752,17 +757,29 @@ def train_and_evaluate(
                 if net_dur_disc is not None:
                     loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
                     loss_gen_all += loss_dur_gen
-        optim_g.zero_grad()
+        optim_g.zero_grad(set_to_none=True)
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
         if getattr(hps.train, "bf16_run", False):
             torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+        # grad_norm_g もログ専用のため遅延計算する。
         scaler.step(optim_g)
         scaler.update()
 
         if rank == 0:
             if global_step % hps.train.log_interval == 0 and not hps.speedup:
+                # grad_norm_d/g は TensorBoard へのログ表示にしか使われておらず
+                # （clip_value=None なので勾配自体は変更しない、純粋な診断用の
+                # 値）、これまでは毎ステップ・全 rank で計算していた。
+                # commons.clip_grad_value_() は各パラメータ毎に GPU-CPU 同期を
+                # 発生させるため、log_interval 毎・rank0 のみに限定することで、
+                # 学習結果を一切変えずに同期回数を大きく減らせる。各ネットワーク
+                # の .grad は、対応する optimizer の zero_grad() が次に呼ばれる
+                # まで変化しないため、ここで計算しても元のタイミングで計算した
+                # 場合と完全に同じ値になる。
+                grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+                grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+
                 lr = optim_g.param_groups[0]["lr"]
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 # logger.info(

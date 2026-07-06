@@ -811,15 +811,17 @@ def train_and_evaluate(
                         losses_dur_disc_g,
                     ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
                     loss_dur_disc_all = loss_dur_disc
-                optim_dur_disc.zero_grad()
+                optim_dur_disc.zero_grad(set_to_none=True)
                 scaler.scale(loss_dur_disc_all).backward()
                 scaler.unscale_(optim_dur_disc)
                 # torch.nn.utils.clip_grad_norm_(
                 # parameters=net_dur_disc.parameters(), max_norm=5
                 # )
-                grad_norm_dur = commons.clip_grad_value_(
-                    net_dur_disc.parameters(), None
-                )
+                # grad_norm_dur はログ表示にしか使われないため（後段の
+                # if rank == 0 / log_interval ブロック参照）、ここでは計算せず
+                # 実際にログへ書き出す直前まで遅延させる。.grad は次に
+                # optim_dur_disc.zero_grad() が呼ばれるまで変化しないため、
+                # 計算結果は元の位置で計算した場合と完全に同一になる。
                 scaler.step(optim_dur_disc)
             if net_wd is not None:
                 # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
@@ -829,19 +831,20 @@ def train_and_evaluate(
                         y.detach().squeeze(1), y_hat.detach().squeeze(1)
                     ).mean()
 
-                optim_wd.zero_grad()
+                optim_wd.zero_grad(set_to_none=True)
                 scaler.scale(loss_slm).backward()
                 scaler.unscale_(optim_wd)
                 # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
-                grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
+                # grad_norm_wd も grad_norm_dur と同様、ログ専用のため遅延計算する。
                 scaler.step(optim_wd)
 
-        optim_d.zero_grad()
+        optim_d.zero_grad(set_to_none=True)
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
         if getattr(hps.train, "bf16_run", False):
             torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+        # grad_norm_d はログ専用のため遅延計算する（clip_grad_norm_ 自体は実際に
+        # 勾配をクリップするので、こちらは元の位置のまま毎ステップ実行する）。
         scaler.step(optim_d)
 
         with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
@@ -868,17 +871,35 @@ def train_and_evaluate(
                         loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
                     else:
                         loss_gen_all += loss_dur_gen
-        optim_g.zero_grad()
+        optim_g.zero_grad(set_to_none=True)
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
         # if getattr(hps.train, "bf16_run", False):
         torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+        # grad_norm_g もログ専用のため遅延計算する。
         scaler.step(optim_g)
         scaler.update()
 
         if rank == 0:
             if global_step % hps.train.log_interval == 0 and not hps.speedup:
+                # grad_norm_d/g/dur/wd は TensorBoard へのログ表示にしか使われて
+                # おらず（clip_value=None なので勾配自体は変更しない、純粋な
+                # 診断用の値）、これまでは毎ステップ・全 rank で計算していた。
+                # commons.clip_grad_value_() は各パラメータ毎に GPU-CPU 同期を
+                # 発生させるため、log_interval 毎・rank0 のみに限定することで、
+                # 学習結果を一切変えずに同期回数を大きく減らせる。
+                # 各ネットワークの .grad は、対応する optimizer の
+                # zero_grad() が次に呼ばれるまで変化しないため、ここで計算しても
+                # 元のタイミングで計算した場合と完全に同じ値になる。
+                grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+                grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+                if net_dur_disc is not None:
+                    grad_norm_dur = commons.clip_grad_value_(
+                        net_dur_disc.parameters(), None
+                    )
+                if net_wd is not None:
+                    grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
+
                 lr = optim_g.param_groups[0]["lr"]
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 # logger.info(

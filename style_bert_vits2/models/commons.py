@@ -204,20 +204,49 @@ def clip_grad_value_(
 
     Returns:
         float: 総ノルム
+
+    Note:
+        元実装はパラメータ数だけ Python ループを回し、`.item()` を1テンソルずつ
+        呼び出していたため、そのたびに GPU-CPU 間の同期が発生していた（ネットワーク
+        1つあたり数百回になることもある）。特にステップ時間の短い高速な GPU では、
+        この同期待ちがボトルネックになりやすい。
+        `torch._foreach_norm` / `torch._foreach_clamp_*` を使い、同期を関数全体で
+        高々1回（`.item()` 1回）に削減する。値は元実装と数学的に同一（クランプ処理は
+        bit-exact、ノルムは元実装が Python の float（=倍精度）で累積していたのに
+        合わせて倍精度で合算するため、実用上 bit-exact 相当）。
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    parameters = [p for p in parameters if p.grad is not None]
     norm_type = float(norm_type)
+    if len(parameters) == 0:
+        return 0.0
+
+    grads = [p.grad for p in parameters]
+
     if clip_value is not None:
         clip_value = float(clip_value)
+        # p.grad.data.clamp_(min=-clip_value, max=clip_value) と bit-exact
+        torch._foreach_clamp_min_(grads, -clip_value)
+        torch._foreach_clamp_max_(grads, clip_value)
 
-    total_norm = 0.0
-    for p in parameters:
-        assert p.grad is not None
-        param_norm = p.grad.data.norm(norm_type)
-        total_norm += param_norm.item() ** norm_type
-        if clip_value is not None:
-            p.grad.data.clamp_(min=-clip_value, max=clip_value)
-    total_norm = total_norm ** (1.0 / norm_type)
-    return total_norm
+    if norm_type == float("inf"):
+        per_tensor_norms = [g.detach().abs().max() for g in grads]
+        total_norm = torch.stack(per_tensor_norms).max().double()
+    else:
+        # torch._foreach_norm は device/dtype が揃ったテンソル群でのみ動作するため、
+        # 念のためグルーピングしてから呼び出す（通常このリポジトリでは全て同一
+        # device/dtype の float32 なので、実際には1グループにまとまる）。
+        groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+        for g in grads:
+            groups.setdefault((g.device, g.dtype), []).append(g)
+        per_tensor_norms = []
+        for group_grads in groups.values():
+            per_tensor_norms.extend(torch._foreach_norm(group_grads, norm_type))
+        # 倍精度で合算することで、元実装（Python float = 倍精度で累積）と
+        # 同じ丸め誤差になるようにする。
+        stacked = torch.stack([n.double() for n in per_tensor_norms])
+        total_norm = stacked.pow(norm_type).sum().pow(1.0 / norm_type)
+
+    # ここで初めて（関数全体で1回だけ）GPU-CPU 同期が発生する。
+    return total_norm.item()
