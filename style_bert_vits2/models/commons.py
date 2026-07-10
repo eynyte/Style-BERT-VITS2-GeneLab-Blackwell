@@ -111,17 +111,23 @@ def rand_slice_segments(
     return ret, ids_str
 
 
-def subsequent_mask(length: int) -> torch.Tensor:
+def subsequent_mask(
+    length: int, device: Optional[torch.device] = None
+) -> torch.Tensor:
     """
     後続のマスクを生成する
 
     Args:
         length (int): マスクのサイズ
+        device (Optional[torch.device]): マスクを生成するデバイス。
+            指定しない場合は従来通り CPU 上に生成される。
+            呼び出し側で GPU 上のテンソルと組み合わせる場合は、ここに
+            対象デバイスを渡すことで CPU→GPU の余分なコピーを避けられる。
 
     Returns:
         torch.Tensor: 生成されたマスク
     """
-    mask = torch.tril(torch.ones(length, length)).unsqueeze(0).unsqueeze(0)
+    mask = torch.tril(torch.ones(length, length, device=device)).unsqueeze(0).unsqueeze(0)
     return mask
 
 
@@ -204,20 +210,35 @@ def clip_grad_value_(
 
     Returns:
         float: 総ノルム
+
+    Note:
+        元の実装はパラメータ 1 つごとに `.item()` を呼んでおり、その都度 GPU→CPU の
+        同期が発生していた(このモデルではパラメータ数が多く、かつこの関数は
+        1 ステップあたり最大 4 回(net_g, net_d, net_dur_disc, net_wd)呼ばれるため、
+        学習ループ全体の速度に無視できない影響があった)。
+        ここでは各パラメータのノルム計算まではすべて GPU 上でまとめて行い、
+        CPU への同期 (`.item()`) は関数全体で 1 回だけになるようにしている。
+        計算結果(戻り値・クリップ後の勾配)は元の実装と数学的に同一。
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    parameters = [p for p in parameters if p.grad is not None]
     norm_type = float(norm_type)
     if clip_value is not None:
         clip_value = float(clip_value)
 
-    total_norm = 0.0
-    for p in parameters:
-        assert p.grad is not None
-        param_norm = p.grad.data.norm(norm_type)
-        total_norm += param_norm.item() ** norm_type
-        if clip_value is not None:
+    if len(parameters) == 0:
+        return 0.0
+
+    # 各パラメータの勾配ノルムは GPU 上のテンソルのまま集約し(同期なし)、
+    # 元の実装と同じ式 total_norm = (Σ‖g_i‖_p^p) ** (1/p) を最後に1回だけ評価する。
+    # float64 に upcast してから集約することで、Python float(倍精度)で逐次
+    # 加算していた元の実装との数値誤差を最小限に抑えている。
+    norms = torch.stack([p.grad.data.norm(norm_type) for p in parameters]).double()
+    total_norm = (norms**norm_type).sum().item() ** (1.0 / norm_type)
+
+    if clip_value is not None:
+        for p in parameters:
             p.grad.data.clamp_(min=-clip_value, max=clip_value)
-    total_norm = total_norm ** (1.0 / norm_type)
+
     return total_norm

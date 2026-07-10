@@ -15,6 +15,14 @@ def feature_loss(fmap_r, fmap_g):
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    # 注: r_losses/g_losses は (元々の generator_loss と同様に) GPU 上の
+    # detach 済みテンソルのまま返す。以前は r_loss.item()/g_loss.item() を
+    # サブ判別器の数だけ毎ステップ呼んでおり、そのたびに GPU→CPU の同期が
+    # 発生していた(discriminator_loss は log_interval に関係なく毎ステップ
+    # 呼ばれるため、ここでの同期コストが特に大きかった)。呼び出し側では
+    # ログ出力(TensorBoard への書き込み)時にしかこれらの値を使わないため、
+    # ここでは同期せずに GPU 上に置いたままにし、実際に必要になるまで
+    # 同期を遅延させる。
     loss = 0
     r_losses = []
     g_losses = []
@@ -24,8 +32,8 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
         r_loss = torch.mean((1 - dr) ** 2)
         g_loss = torch.mean(dg**2)
         loss += r_loss + g_loss
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
+        r_losses.append(r_loss.detach())
+        g_losses.append(g_loss.detach())
 
     return loss, r_losses, g_losses
 

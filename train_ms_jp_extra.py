@@ -37,7 +37,7 @@ from style_bert_vits2.models.models_jp_extra import (
 from style_bert_vits2.nlp.symbols import SYMBOLS
 from style_bert_vits2.utils.stdout_wrapper import SAFE_STDOUT
 
-
+torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = (
     True  # If encontered training problem,please try to disable TF32.
@@ -1066,14 +1066,18 @@ def evaluate(hps, generator, eval_loader, writer_eval):
             bert,
             style_vec,
         ) in enumerate(eval_loader):
-            x, x_lengths = x.cuda(), x_lengths.cuda()
-            spec, spec_lengths = spec.cuda(), spec_lengths.cuda()
-            y, y_lengths = y.cuda(), y_lengths.cuda()
-            speakers = speakers.cuda()
-            bert = bert.cuda()
-            tone = tone.cuda()
-            language = language.cuda()
-            style_vec = style_vec.cuda()
+            # eval_loader は pin_memory=True のため、non_blocking=True で転送し
+            # (train_and_evaluate 内の学習ループと同様に) 同期待ちを減らす
+            x, x_lengths = x.cuda(non_blocking=True), x_lengths.cuda(non_blocking=True)
+            spec, spec_lengths = spec.cuda(non_blocking=True), spec_lengths.cuda(
+                non_blocking=True
+            )
+            y, y_lengths = y.cuda(non_blocking=True), y_lengths.cuda(non_blocking=True)
+            speakers = speakers.cuda(non_blocking=True)
+            bert = bert.cuda(non_blocking=True)
+            tone = tone.cuda(non_blocking=True)
+            language = language.cuda(non_blocking=True)
+            style_vec = style_vec.cuda(non_blocking=True)
             for use_sdp in [True, False]:
                 y_hat, attn, mask, *_ = generator.module.infer(
                     x,
