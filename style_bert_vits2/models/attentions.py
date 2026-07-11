@@ -3,9 +3,32 @@ from typing import Any, Optional
 
 import torch
 from torch import nn
+from torch.cuda.amp import autocast
 from torch.nn import functional as F
 
 from style_bert_vits2.models import commons
+
+
+def _assert_finite(tensor: Optional[torch.Tensor], name: str) -> None:
+    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。
+    問題箇所が判明したら削除して構わない。models_jp_extra.py の同名関数と重複しているが、
+    循環importを避けるためここでも定義している。"""
+    if tensor is None:
+        return
+    if not torch.isfinite(tensor).all():
+        nan_count = int(torch.isnan(tensor).sum().item())
+        inf_count = int(torch.isinf(tensor).sum().item())
+        finite_vals = tensor[torch.isfinite(tensor)]
+        if finite_vals.numel() > 0:
+            finite_min = finite_vals.min().item()
+            finite_max = finite_vals.max().item()
+        else:
+            finite_min = finite_max = float("nan")
+        raise RuntimeError(
+            f"[fp16 debug] '{name}' に非有限値を検出: NaN={nan_count}, Inf={inf_count}, "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"finite_range=({finite_min:.4g}, {finite_max:.4g})"
+        )
 
 
 class LayerNorm(nn.Module):
@@ -114,12 +137,16 @@ class Encoder(nn.Module):
                 x = x + g
                 x = x * x_mask
             y = self.attn_layers[i](x, x, attn_mask)
+            _assert_finite(y, f"encoder layer {i} attn output")
             y = self.drop(y)
             x = self.norm_layers_1[i](x + y)
+            _assert_finite(x, f"encoder layer {i} post-norm1")
 
             y = self.ffn_layers[i](x, x_mask)
+            _assert_finite(y, f"encoder layer {i} ffn output")
             y = self.drop(y)
             x = self.norm_layers_2[i](x + y)
+            _assert_finite(x, f"encoder layer {i} post-norm2")
         x = x * x_mask
         return x
 
@@ -297,35 +324,48 @@ class MultiHeadAttention(nn.Module):
         key = key.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
         value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
 
-        scores = torch.matmul(query / math.sqrt(self.k_channels), key.transpose(-2, -1))
-        if self.window_size is not None:
-            assert (
-                t_s == t_t
-            ), "Relative attention is only available for self-attention."
-            key_relative_embeddings = self._get_relative_embeddings(self.emb_rel_k, t_s)
-            rel_logits = self._matmul_with_relative_keys(
-                query / math.sqrt(self.k_channels), key_relative_embeddings
+        # [fp16 debug / fix] 生のQK^Tスコア計算・相対位置バイアスの加算はfp16 autocast下で
+        # 容易にオーバーフローするため(Flash Attention等の融合カーネルと違い、
+        # ここは手書きのmatmul実装で内部の数値安定化がない)、明示的にfp32で計算する。
+        # softmaxまでをfp32区間に収め、その後のvalueとのmatmulはfp16に戻して速度を維持する。
+        with autocast(enabled=False):
+            query_f = query.float()
+            key_f = key.float()
+            scores = torch.matmul(
+                query_f / math.sqrt(self.k_channels), key_f.transpose(-2, -1)
             )
-            scores_local = self._relative_position_to_absolute_position(rel_logits)
-            scores = scores + scores_local
-        if self.proximal_bias:
-            assert t_s == t_t, "Proximal bias is only available for self-attention."
-            scores = scores + self._attention_bias_proximal(t_s).to(
-                device=scores.device, dtype=scores.dtype
-            )
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e4)
-            if self.block_length is not None:
+            if self.window_size is not None:
                 assert (
                     t_s == t_t
-                ), "Local attention is only available for self-attention."
-                block_mask = (
-                    torch.ones_like(scores)
-                    .triu(-self.block_length)
-                    .tril(self.block_length)
+                ), "Relative attention is only available for self-attention."
+                key_relative_embeddings = self._get_relative_embeddings(
+                    self.emb_rel_k, t_s
                 )
-                scores = scores.masked_fill(block_mask == 0, -1e4)
-        p_attn = F.softmax(scores, dim=-1)  # [b, n_h, t_t, t_s]
+                rel_logits = self._matmul_with_relative_keys(
+                    query_f / math.sqrt(self.k_channels),
+                    key_relative_embeddings.float(),
+                )
+                scores_local = self._relative_position_to_absolute_position(rel_logits)
+                scores = scores + scores_local
+            if self.proximal_bias:
+                assert t_s == t_t, "Proximal bias is only available for self-attention."
+                scores = scores + self._attention_bias_proximal(t_s).to(
+                    device=scores.device, dtype=scores.dtype
+                )
+            if mask is not None:
+                scores = scores.masked_fill(mask == 0, -1e4)
+                if self.block_length is not None:
+                    assert (
+                        t_s == t_t
+                    ), "Local attention is only available for self-attention."
+                    block_mask = (
+                        torch.ones_like(scores)
+                        .triu(-self.block_length)
+                        .tril(self.block_length)
+                    )
+                    scores = scores.masked_fill(block_mask == 0, -1e4)
+            _assert_finite(scores, "attention scores (pre-softmax)")
+            p_attn = F.softmax(scores, dim=-1)  # [b, n_h, t_t, t_s]
         p_attn = self.drop(p_attn)
         output = torch.matmul(p_attn, value)
         if self.window_size is not None:
