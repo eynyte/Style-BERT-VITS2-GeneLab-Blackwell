@@ -3,6 +3,7 @@ from typing import Any, Optional
 
 import torch
 from torch import nn
+from torch.cuda.amp import autocast
 from torch.nn import Conv1d, Conv2d, ConvTranspose1d
 from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
@@ -1073,7 +1074,17 @@ class SynthesizerTrn(nn.Module):
 
         w = attn.sum(2)
 
-        l_length_sdp = self.sdp(x, x_mask, w, g=g)
+        # StochasticDurationPredictor は正規化フロー内部で exp/log を多用するため、
+        # fp16 autocast 下だと極端な値が容易に inf/NaN 化し、後段の
+        # rational_quadratic_spline で「入力が空集合」エラーを誘発する。
+        # 生成器全体のfp16化とは切り離し、このサブモジュールだけ明示的にfp32で計算する。
+        with autocast(enabled=False):
+            l_length_sdp = self.sdp(
+                x.float(),
+                x_mask.float(),
+                w.float(),
+                g=g.float() if g is not None else None,
+            )
         l_length_sdp = l_length_sdp / torch.sum(x_mask)
 
         logw_ = torch.log(w + 1e-6) * x_mask
@@ -1132,9 +1143,16 @@ class SynthesizerTrn(nn.Module):
         x, m_p, logs_p, x_mask = self.enc_p(
             x, x_lengths, tone, language, bert, style_vec, g=g
         )
-        logw = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w) * (
-            sdp_ratio
-        ) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
+        # 学習時と同じ理由で、推論時もこのサブモジュールだけfp32で計算する。
+        with autocast(enabled=False):
+            logw_sdp = self.sdp(
+                x.float(),
+                x_mask.float(),
+                g=g.float() if g is not None else None,
+                reverse=True,
+                noise_scale=noise_scale_w,
+            )
+        logw = logw_sdp * (sdp_ratio) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
