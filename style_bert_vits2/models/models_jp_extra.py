@@ -12,6 +12,27 @@ from style_bert_vits2.models import attentions, commons, modules, monotonic_alig
 from style_bert_vits2.nlp.symbols import NUM_LANGUAGES, NUM_TONES, SYMBOLS
 
 
+def _assert_finite(tensor: Optional[torch.Tensor], name: str) -> None:
+    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。
+    問題箇所が判明したら削除して構わない。"""
+    if tensor is None:
+        return
+    if not torch.isfinite(tensor).all():
+        nan_count = int(torch.isnan(tensor).sum().item())
+        inf_count = int(torch.isinf(tensor).sum().item())
+        finite_vals = tensor[torch.isfinite(tensor)]
+        if finite_vals.numel() > 0:
+            finite_min = finite_vals.min().item()
+            finite_max = finite_vals.max().item()
+        else:
+            finite_min = finite_max = float("nan")
+        raise RuntimeError(
+            f"[fp16 debug] '{name}' に非有限値を検出: NaN={nan_count}, Inf={inf_count}, "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"finite_range=({finite_min:.4g}, {finite_max:.4g})"
+        )
+
+
 class DurationDiscriminator(nn.Module):  # vits2
     def __init__(
         self,
@@ -1073,6 +1094,15 @@ class SynthesizerTrn(nn.Module):
             )
 
         w = attn.sum(2)
+
+        # [fp16 debug] self.sdp に渡る直前の時点で x/x_mask/w/g が既に壊れていないか確認する。
+        # ここで例外が出れば「self.sdpより手前(エンコーダ等)で既にNaN/Infが発生している」と確定する。
+        # ここを通過して尚 self.sdp 内部でクラッシュする場合は、fp32化しても直らない
+        # 何か別の原因(事前学習チェックポイント自体の破損等)を疑う必要がある。
+        _assert_finite(x, "x (pre-sdp)")
+        _assert_finite(x_mask, "x_mask (pre-sdp)")
+        _assert_finite(w, "w (pre-sdp)")
+        _assert_finite(g, "g (pre-sdp)")
 
         # StochasticDurationPredictor は正規化フロー内部で exp/log を多用するため、
         # fp16 autocast 下だと極端な値が容易に inf/NaN 化し、後段の
