@@ -62,7 +62,6 @@ Triton は必須依存にしていません。`maximum_path` は次の優先順�
 
 さらに欲を言えば forward/backward を1カーネルに統合してカーネル起動をさらに1回減らす余地もありますが、効果は小さく複雑さが増すため、今回は見送りました。必要であれば対応します。
 """
-exec_cmd("pip install triton")
 
 import warnings
 from typing import Any
