@@ -197,6 +197,14 @@ def clip_grad_value_(
     """
     勾配の値をクリップする
 
+    最適化メモ:
+        元実装はパラメータ1つごとに `.item()` を呼んでおり、これは呼び出しの
+        たびに GPU の計算完了を待つ同期(GPU-CPU sync)を発生させていた。
+        モデルのパラメータ数が多いほど、この同期待ちが学習ループのボトルネックになり
+        GPU使用率が下がる原因になる。
+        `torch._foreach_*` はパラメータのリストをまとめて1回のカーネル起動で処理する
+        バッチ化APIで、同期は最後に `total_norm.item()` を呼ぶ1回のみで済む。
+
     Args:
         parameters (Union[torch.Tensor, list[torch.Tensor]]): クリップするパラメータ
         clip_value (Optional[float]): クリップする値。None の場合はクリップしない
@@ -209,15 +217,30 @@ def clip_grad_value_(
         parameters = [parameters]
     parameters = list(filter(lambda p: p.grad is not None, parameters))
     norm_type = float(norm_type)
+
+    if len(parameters) == 0:
+        return 0.0
+
+    grads = [p.grad for p in parameters]
+
+    # PyTorch 標準の集約ロジックを利用(内部で torch._foreach_norm によるバッチ計算
+    # を行い、デバイス/dtype ごとにグループ化してから1回だけ集計する。
+    # foreach=True を明示し、CPU テンソル環境で誤って低速なフォールバック
+    # (パラメータ毎の逐次ループ)に落ちないようにする)
+    if hasattr(torch.nn.utils, "get_total_norm"):
+        total_norm = torch.nn.utils.get_total_norm(grads, norm_type, foreach=True)
+    else:
+        # 古い torch バージョン向けフォールバック(torch._foreach_norm を直接利用)
+        per_param_norms = torch._foreach_norm(grads, norm_type)
+        total_norm = torch.linalg.vector_norm(
+            torch.stack(per_param_norms), norm_type
+        )
+
     if clip_value is not None:
         clip_value = float(clip_value)
+        # in-place のバッチ clamp。ループ内で毎回 .item() する必要はない
+        torch._foreach_clamp_min_(grads, -clip_value)
+        torch._foreach_clamp_max_(grads, clip_value)
 
-    total_norm = 0.0
-    for p in parameters:
-        assert p.grad is not None
-        param_norm = p.grad.data.norm(norm_type)
-        total_norm += param_norm.item() ** norm_type
-        if clip_value is not None:
-            p.grad.data.clamp_(min=-clip_value, max=clip_value)
-    total_norm = total_norm ** (1.0 / norm_type)
-    return total_norm
+    # ここで初めて GPU→CPU 同期が1回だけ発生する
+    return total_norm.item()
