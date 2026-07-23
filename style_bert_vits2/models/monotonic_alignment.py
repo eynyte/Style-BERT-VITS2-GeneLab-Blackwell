@@ -35,13 +35,12 @@ def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 from super_monotonic_align import maximum_path as _sma_maximum_path
-def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def xmaximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     sbv2/VITS 側: neg_cent, mask は [B, T_mel, T_text]
     super-monotonic-align 側: [B, T_text, T_mel] (Glow-TTS 由来) を要求するため
     dim1/dim2 を入れ替えてから渡し、結果をまた入れ替えて戻す。
     """
-    print("a")
     dtype = neg_cent.dtype
     neg_cent_t = neg_cent.transpose(1, 2).float()   # [B, T_text, T_mel], fp32
     mask_t = mask.transpose(1, 2).to(torch.int32)   # [B, T_text, T_mel]
