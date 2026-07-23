@@ -82,14 +82,10 @@ class StepProfiler:
         logger.info("\n".join(lines))
         self.totals.clear()
         self.counts.clear()
-
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = (
     True  # If encontered training problem,please try to disable TF32.
 )
-# 入力サイズが安定しているバケットサンプラー使用時に cuDNN が最適カーネルを自動選択
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
 torch.set_num_threads(1)
 torch.set_float32_matmul_precision("medium")
 torch.backends.cuda.sdp_kernel("flash")
@@ -105,10 +101,6 @@ api = HfApi()
 
 
 def run():
-    # CUDA メモリ断片化を抑えて OOM を低減 (PyTorch 2.1+)
-    import os as _os
-    _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
     # Command line configuration is not recommended unless necessary, use config.yml
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -283,17 +275,17 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            # num_workers を増やして GPU への供給を途切れさせない
-            # メモリが不足する場合は 1〜2 に下げてください
-            num_workers=min(config.train_ms_config.num_workers, max(2, os.cpu_count() // 4)),
+            # メモリ消費量を減らそうとnum_workersを1にしてみる
+            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
+            num_workers=1,
             shuffle=False,
             pin_memory=True,
             collate_fn=collate_fn,
             batch_sampler=train_sampler,
             # batch_size=hps.train.batch_size,
             persistent_workers=True,
-            # ワーカーが GPU 消費より先に次バッチを準備するためのプリフェッチ数
-            prefetch_factor=2,
+            # これもメモリ消費量を減らそうとしてコメントアウト
+            # prefetch_factor=6,
         )
     else:
         train_sampler = DistributedLengthGroupedSampler(
@@ -306,17 +298,17 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            # num_workers を増やして GPU への供給を途切れさせない
-            # メモリが不足する場合は 1〜2 に下げてください
-            num_workers=min(config.train_ms_config.num_workers, max(2, os.cpu_count() // 4)),
+            # メモリ消費量を減らそうとnum_workersを1にしてみる
+            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
+            num_workers=1,
             # shuffle=True,
             pin_memory=True,
             collate_fn=collate_fn,
             sampler=train_sampler,
             batch_size=hps.train.batch_size,
             persistent_workers=True,
-            # ワーカーが GPU 消費より先に次バッチを準備するためのプリフェッチ数
-            prefetch_factor=2,
+            # これもメモリ消費量を減らそうとしてコメントアウト
+            # prefetch_factor=6,
         )
         logger.info("Using DistributedLengthGroupedSampler for training.")
         logger.debug(f"len(train_dataset): {len(train_dataset)}")
@@ -447,24 +439,24 @@ def run():
     net_g = DDP(
         net_g,
         device_ids=[local_rank],
-        bucket_cap_mb=512,  # 勾配通信をまとめて送信し NCCL オーバーヘッドを削減
+        # bucket_cap_mb=512
     )
     net_d = DDP(
         net_d,
         device_ids=[local_rank],
-        bucket_cap_mb=512,
+        # bucket_cap_mb=512
     )
     if net_dur_disc is not None:
         net_dur_disc = DDP(
             net_dur_disc,
             device_ids=[local_rank],
-            bucket_cap_mb=256,
+            # bucket_cap_mb=512,
         )
     if net_wd is not None:
         net_wd = DDP(
             net_wd,
             device_ids=[local_rank],
-            bucket_cap_mb=256,
+            #  bucket_cap_mb=512
         )
 
     if utils.is_resuming(model_dir):
@@ -602,25 +594,6 @@ def run():
         scheduler_wd = None
         wl = None
     scaler = GradScaler(enabled=hps.train.bf16_run)
-
-    # ── torch.compile によるカーネル融合（PyTorch 2.0+ のみ）──────────────────
-    # 可変長シーケンスがあるため mode="default" を使用（CUDA グラフ不使用）。
-    # 問題が発生した場合は以下のブロックを削除してください。
-    if hasattr(torch, "compile"):
-        try:
-            net_g.module = torch.compile(net_g.module, mode="default")
-            net_d.module = torch.compile(net_d.module, mode="default")
-            if net_dur_disc is not None:
-                net_dur_disc.module = torch.compile(
-                    net_dur_disc.module, mode="default"
-                )
-            if net_wd is not None:
-                net_wd.module = torch.compile(net_wd.module, mode="default")
-            logger.info("torch.compile を適用しました（初回イテレーションにコンパイル時間がかかります）。")
-        except Exception as e:
-            logger.warning(f"torch.compile の適用をスキップします: {e}")
-    # ─────────────────────────────────────────────────────────────────────────
-
     logger.info("Start training.")
 
     diff = abs(
@@ -744,6 +717,509 @@ def run():
 
     if pbar is not None:
         pbar.close()
+
+
+def _need_grad_norm_log(rank: int, hps, global_step: int) -> bool:
+    """
+    grad_norm_* をログ用に計算する必要があるかどうかを判定する。
+
+    commons.clip_grad_value_(parameters, None) はクリップを行わず、ログに使う
+    総ノルムを得るためだけにパラメータ毎の .item() 同期を発生させていた。
+    ログしないステップ・rank!=0 のプロセスでは計算自体を丸ごとスキップすることで、
+    無駄な GPU-CPU 同期を削減する。
+    """
+    if rank != 0:
+        return False
+    if getattr(hps, "speedup", False):
+        return False
+    return global_step % hps.train.log_interval == 0
+
+
+def train_and_evaluate(
+    rank,
+    local_rank,
+    epoch,
+    hps,
+    nets,
+    optims,
+    schedulers,
+    scaler,
+    loaders,
+    logger,
+    writers,
+    pbar: tqdm,
+    initial_step: int,
+):
+    net_g, net_d, net_dur_disc, net_wd, wl = nets
+    optim_g, optim_d, optim_dur_disc, optim_wd = optims
+    scheduler_g, scheduler_d, scheduler_dur_disc, scheduler_wd = schedulers
+    train_loader, eval_loader = loaders
+    if writers is not None:
+        writer, writer_eval = writers
+
+    # train_loader.batch_sampler.set_epoch(epoch)
+    global global_step
+
+    net_g.train()
+    net_d.train()
+    if net_dur_disc is not None:
+        net_dur_disc.train()
+    if net_wd is not None:
+        net_wd.train()
+    for batch_idx, (
+        x,
+        x_lengths,
+        spec,
+        spec_lengths,
+        y,
+        y_lengths,
+        speakers,
+        tone,
+        language,
+        bert,
+        style_vec,
+    ) in enumerate(train_loader):
+        if net_g.module.use_noise_scaled_mas:
+            current_mas_noise_scale = (
+                net_g.module.mas_noise_scale_initial
+                - net_g.module.noise_scale_delta * global_step
+            )
+            net_g.module.current_mas_noise_scale = max(current_mas_noise_scale, 0.0)
+        x, x_lengths = x.cuda(local_rank, non_blocking=True), x_lengths.cuda(
+            local_rank, non_blocking=True
+        )
+        spec, spec_lengths = spec.cuda(
+            local_rank, non_blocking=True
+        ), spec_lengths.cuda(local_rank, non_blocking=True)
+        y, y_lengths = y.cuda(local_rank, non_blocking=True), y_lengths.cuda(
+            local_rank, non_blocking=True
+        )
+        speakers = speakers.cuda(local_rank, non_blocking=True)
+        tone = tone.cuda(local_rank, non_blocking=True)
+        language = language.cuda(local_rank, non_blocking=True)
+        bert = bert.cuda(local_rank, non_blocking=True)
+        style_vec = style_vec.cuda(local_rank, non_blocking=True)
+
+        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+            (
+                y_hat,
+                l_length,
+                attn,
+                ids_slice,
+                x_mask,
+                z_mask,
+                (z, z_p, m_p, logs_p, m_q, logs_q),
+                (hidden_x, logw, logw_),  # , logw_sdp),
+                g,
+            ) = net_g(
+                x,
+                x_lengths,
+                spec,
+                spec_lengths,
+                speakers,
+                tone,
+                language,
+                bert,
+                style_vec,
+            )
+            mel = spec_to_mel_torch(
+                spec,
+                hps.data.filter_length,
+                hps.data.n_mel_channels,
+                hps.data.sampling_rate,
+                hps.data.mel_fmin,
+                hps.data.mel_fmax,
+            )
+            y_mel = commons.slice_segments(
+                mel, ids_slice, hps.train.segment_size // hps.data.hop_length
+            )
+            y_hat_mel = mel_spectrogram_torch(
+                y_hat.squeeze(1).float(),
+                hps.data.filter_length,
+                hps.data.n_mel_channels,
+                hps.data.sampling_rate,
+                hps.data.hop_length,
+                hps.data.win_length,
+                hps.data.mel_fmin,
+                hps.data.mel_fmax,
+            )
+
+            y = commons.slice_segments(
+                y, ids_slice * hps.data.hop_length, hps.train.segment_size
+            )  # slice
+
+            # Discriminator
+            y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+                loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
+                    y_d_hat_r, y_d_hat_g
+                )
+                loss_disc_all = loss_disc
+            if net_dur_disc is not None:
+                y_dur_hat_r, y_dur_hat_g = net_dur_disc(
+                    hidden_x.detach(),
+                    x_mask.detach(),
+                    logw_.detach(),
+                    logw.detach(),
+                    g.detach(),
+                )
+                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+                    # TODO: I think need to mean using the mask, but for now, just mean all
+                    (
+                        loss_dur_disc,
+                        losses_dur_disc_r,
+                        losses_dur_disc_g,
+                    ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
+                    loss_dur_disc_all = loss_dur_disc
+                optim_dur_disc.zero_grad()
+                scaler.scale(loss_dur_disc_all).backward()
+                scaler.unscale_(optim_dur_disc)
+                # NOTE: 元の commons.clip_grad_value_(..., None) はクリップを行わず、
+                # ログ用の総ノルムを計算するためだけにパラメータ毎に .item() 同期していた。
+                # ログを取らないステップ・rankでは計算自体をスキップする。
+                if _need_grad_norm_log(rank, hps, global_step):
+                    grad_norm_dur = torch.nn.utils.clip_grad_norm_(
+                        net_dur_disc.parameters(), max_norm=float("inf")
+                    ).item()
+                else:
+                    grad_norm_dur = 0.0
+                scaler.step(optim_dur_disc)
+            if net_wd is not None:
+                # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
+                # shape: (batch, 1, time)
+                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+                    loss_slm = wl.discriminator(
+                        y.detach().squeeze(1), y_hat.detach().squeeze(1)
+                    ).mean()
+
+                optim_wd.zero_grad()
+                scaler.scale(loss_slm).backward()
+                scaler.unscale_(optim_wd)
+                if _need_grad_norm_log(rank, hps, global_step):
+                    grad_norm_wd = torch.nn.utils.clip_grad_norm_(
+                        net_wd.parameters(), max_norm=float("inf")
+                    ).item()
+                else:
+                    grad_norm_wd = 0.0
+                scaler.step(optim_wd)
+
+        optim_d.zero_grad()
+        scaler.scale(loss_disc_all).backward()
+        scaler.unscale_(optim_d)
+        if getattr(hps.train, "bf16_run", False):
+            torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
+        if _need_grad_norm_log(rank, hps, global_step):
+            grad_norm_d = torch.nn.utils.clip_grad_norm_(
+                net_d.parameters(), max_norm=float("inf")
+            ).item()
+        else:
+            grad_norm_d = 0.0
+        scaler.step(optim_d)
+
+        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+            # Generator
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+            if net_dur_disc is not None:
+                _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+            if net_wd is not None:
+                loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
+                loss_lm_gen = wl.generator(y_hat.squeeze(1))
+            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+                loss_dur = torch.sum(l_length.float())
+                loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+
+                loss_fm = feature_loss(fmap_r, fmap_g)
+                loss_gen, losses_gen = generator_loss(y_d_hat_g)
+                # loss_commit = loss_commit * hps.train.c_commit
+
+                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+                if net_dur_disc is not None:
+                    loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
+                    if net_wd is not None:
+                        loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
+                    else:
+                        loss_gen_all += loss_dur_gen
+        optim_g.zero_grad()
+        scaler.scale(loss_gen_all).backward()
+        scaler.unscale_(optim_g)
+        # if getattr(hps.train, "bf16_run", False):
+        # NOTE: クリッピング自体は毎ステップ必要なのでそのまま実行するが、
+        # 戻り値(総ノルム)をログ用にそのまま再利用し、commons.clip_grad_value_ の
+        # 二重計算(パラメータ毎の .item() 同期)をやめる。
+        total_norm_g = torch.nn.utils.clip_grad_norm_(
+            parameters=net_g.parameters(), max_norm=500
+        )
+        if _need_grad_norm_log(rank, hps, global_step):
+            grad_norm_g = total_norm_g.item()
+        else:
+            grad_norm_g = 0.0
+        scaler.step(optim_g)
+        scaler.update()
+
+        if rank == 0:
+            if global_step % hps.train.log_interval == 0 and not hps.speedup:
+                lr = optim_g.param_groups[0]["lr"]
+                losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
+                # logger.info(
+                #     "Train Epoch: {} [{:.0f}%]".format(
+                #         epoch, 100.0 * batch_idx / len(train_loader)
+                #     )
+                # )
+                # logger.info([x.item() for x in losses] + [global_step, lr])
+
+                scalar_dict = {
+                    "loss/g/total": loss_gen_all,
+                    "loss/d/total": loss_disc_all,
+                    "learning_rate": lr,
+                    "grad_norm_d": grad_norm_d,
+                    "grad_norm_g": grad_norm_g,
+                }
+                scalar_dict.update(
+                    {
+                        "loss/g/fm": loss_fm,
+                        "loss/g/mel": loss_mel,
+                        "loss/g/dur": loss_dur,
+                        "loss/g/kl": loss_kl,
+                    }
+                )
+                scalar_dict.update({f"loss/g/{i}": v for i, v in enumerate(losses_gen)})
+                scalar_dict.update(
+                    {f"loss/d_r/{i}": v for i, v in enumerate(losses_disc_r)}
+                )
+                scalar_dict.update(
+                    {f"loss/d_g/{i}": v for i, v in enumerate(losses_disc_g)}
+                )
+
+                if net_dur_disc is not None:
+                    scalar_dict.update({"loss/dur_disc/total": loss_dur_disc_all})
+
+                    scalar_dict.update(
+                        {
+                            f"loss/dur_disc_g/{i}": v
+                            for i, v in enumerate(losses_dur_disc_g)
+                        }
+                    )
+                    scalar_dict.update(
+                        {
+                            f"loss/dur_disc_r/{i}": v
+                            for i, v in enumerate(losses_dur_disc_r)
+                        }
+                    )
+
+                    scalar_dict.update({"loss/g/dur_gen": loss_dur_gen})
+                    scalar_dict.update(
+                        {f"loss/g/dur_gen_{i}": v for i, v in enumerate(losses_dur_gen)}
+                    )
+
+                if net_wd is not None:
+                    scalar_dict.update(
+                        {
+                            "loss/wd/total": loss_slm,
+                            "grad_norm_wd": grad_norm_wd,
+                            "loss/g/lm": loss_lm,
+                            "loss/g/lm_gen": loss_lm_gen,
+                        }
+                    )
+                # 以降のログは計算が重い気がするし誰も見てない気がするのでコメントアウト
+                # image_dict = {
+                #     "slice/mel_org": utils.plot_spectrogram_to_numpy(
+                #         y_mel[0].data.cpu().numpy()
+                #     ),
+                #     "slice/mel_gen": utils.plot_spectrogram_to_numpy(
+                #         y_hat_mel[0].data.cpu().numpy()
+                #     ),
+                #     "all/mel": utils.plot_spectrogram_to_numpy(
+                #         mel[0].data.cpu().numpy()
+                #     ),
+                #     "all/attn": utils.plot_alignment_to_numpy(
+                #         attn[0, 0].data.cpu().numpy()
+                #     ),
+                # }
+                utils.summarize(
+                    writer=writer,
+                    global_step=global_step,
+                    # images=image_dict,
+                    scalars=scalar_dict,
+                )
+
+            if (
+                global_step % hps.train.eval_interval == 0
+                and global_step != 0
+                and initial_step != global_step
+            ):
+                if not hps.speedup:
+                    evaluate(hps, net_g, eval_loader, writer_eval)
+                utils.checkpoints.save_checkpoint(
+                    net_g,
+                    optim_g,
+                    hps.train.learning_rate,
+                    epoch,
+                    os.path.join(hps.model_dir, f"G_{global_step}.pth"),
+                )
+                utils.checkpoints.save_checkpoint(
+                    net_d,
+                    optim_d,
+                    hps.train.learning_rate,
+                    epoch,
+                    os.path.join(hps.model_dir, f"D_{global_step}.pth"),
+                )
+                if net_dur_disc is not None:
+                    utils.checkpoints.save_checkpoint(
+                        net_dur_disc,
+                        optim_dur_disc,
+                        hps.train.learning_rate,
+                        epoch,
+                        os.path.join(hps.model_dir, f"DUR_{global_step}.pth"),
+                    )
+                if net_wd is not None:
+                    utils.checkpoints.save_checkpoint(
+                        net_wd,
+                        optim_wd,
+                        hps.train.learning_rate,
+                        epoch,
+                        os.path.join(hps.model_dir, f"WD_{global_step}.pth"),
+                    )
+                keep_ckpts = config.train_ms_config.keep_ckpts
+                if keep_ckpts > 0:
+                    utils.checkpoints.clean_checkpoints(
+                        model_dir_path=hps.model_dir,
+                        n_ckpts_to_keep=keep_ckpts,
+                        sort_by_time=True,
+                    )
+                # Save safetensors (for inference) to `model_assets/{model_name}`
+                utils.safetensors.save_safetensors(
+                    net_g,
+                    epoch,
+                    os.path.join(
+                        config.out_dir,
+                        f"{config.model_name}_e{epoch}_s{global_step}.safetensors",
+                    ),
+                    for_infer=True,
+                )
+                if hps.repo_id is not None:
+                    api.upload_folder(
+                        repo_id=hps.repo_id,
+                        folder_path=config.dataset_path,
+                        path_in_repo=f"Data/{config.model_name}",
+                        delete_patterns="*.pth",  # Only keep the latest checkpoint
+                        ignore_patterns=f"{config.dataset_path}/raw",  # Ignore raw data
+                        run_as_future=True,
+                    )
+                    api.upload_folder(
+                        repo_id=hps.repo_id,
+                        folder_path=config.out_dir,
+                        path_in_repo=f"model_assets/{config.model_name}",
+                        run_as_future=True,
+                    )
+
+        global_step += 1
+        if pbar is not None:
+            pbar.set_description(
+                f"Epoch {epoch}({100.0 * batch_idx / len(train_loader):.0f}%)/{hps.train.epochs}"
+            )
+            pbar.update()
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    if pbar is None and rank == 0:
+        logger.info(f"====> Epoch: {epoch}, step: {global_step}")
+
+
+def evaluate(hps, generator, eval_loader, writer_eval):
+    generator.eval()
+    image_dict = {}
+    audio_dict = {}
+    print()
+    logger.info("Evaluating ...")
+    with torch.no_grad():
+        for batch_idx, (
+            x,
+            x_lengths,
+            spec,
+            spec_lengths,
+            y,
+            y_lengths,
+            speakers,
+            tone,
+            language,
+            bert,
+            style_vec,
+        ) in enumerate(eval_loader):
+            x, x_lengths = x.cuda(), x_lengths.cuda()
+            spec, spec_lengths = spec.cuda(), spec_lengths.cuda()
+            y, y_lengths = y.cuda(), y_lengths.cuda()
+            speakers = speakers.cuda()
+            bert = bert.cuda()
+            tone = tone.cuda()
+            language = language.cuda()
+            style_vec = style_vec.cuda()
+            for use_sdp in [True, False]:
+                y_hat, attn, mask, *_ = generator.module.infer(
+                    x,
+                    x_lengths,
+                    speakers,
+                    tone,
+                    language,
+                    bert,
+                    style_vec,
+                    y=spec,
+                    max_len=1000,
+                    sdp_ratio=0.0 if not use_sdp else 1.0,
+                )
+                y_hat_lengths = mask.sum([1, 2]).long() * hps.data.hop_length
+                # 以降のログは計算が重い気がするし誰も見てない気がするのでコメントアウト
+                # mel = spec_to_mel_torch(
+                #     spec,
+                #     hps.data.filter_length,
+                #     hps.data.n_mel_channels,
+                #     hps.data.sampling_rate,
+                #     hps.data.mel_fmin,
+                #     hps.data.mel_fmax,
+                # )
+                # y_hat_mel = mel_spectrogram_torch(
+                #     y_hat.squeeze(1).float(),
+                #     hps.data.filter_length,
+                #     hps.data.n_mel_channels,
+                #     hps.data.sampling_rate,
+                #     hps.data.hop_length,
+                #     hps.data.win_length,
+                #     hps.data.mel_fmin,
+                #     hps.data.mel_fmax,
+                # )
+                # image_dict.update(
+                #     {
+                #         f"gen/mel_{batch_idx}": utils.plot_spectrogram_to_numpy(
+                #             y_hat_mel[0].cpu().numpy()
+                #         )
+                #     }
+                # )
+                # image_dict.update(
+                #     {
+                #         f"gt/mel_{batch_idx}": utils.plot_spectrogram_to_numpy(
+                #             mel[0].cpu().numpy()
+                #         )
+                #     }
+                # )
+                audio_dict.update(
+                    {
+                        f"gen/audio_{batch_idx}_{use_sdp}": y_hat[
+                            0, :, : y_hat_lengths[0]
+                        ]
+                    }
+                )
+                audio_dict.update({f"gt/audio_{batch_idx}": y[0, :, : y_lengths[0]]})
+
+    utils.summarize(
+        writer=writer_eval,
+        global_step=global_step,
+        images=image_dict,
+        audios=audio_dict,
+        audio_sampling_rate=hps.data.sampling_rate,
+    )
+    generator.train()
+
+
 
 
 def train_and_evaluate(
@@ -895,139 +1371,6 @@ def train_and_evaluate(
 
         prof.start()  # ADDED: 次のイテレーションの data_wait 計測開始
 
-def evaluate(hps, generator, eval_loader, writer_eval):
-    generator.eval()
-    image_dict = {}
-    audio_dict = {}
-    print()
-    logger.info("Evaluating ...")
-    with torch.no_grad():
-        for batch_idx, (
-            x,
-            x_lengths,
-            spec,
-            spec_lengths,
-            y,
-            y_lengths,
-            speakers,
-            tone,
-            language,
-            bert,
-            style_vec,
-        ) in enumerate(eval_loader):
-            x, x_lengths = x.cuda(non_blocking=True), x_lengths.cuda(non_blocking=True)
-            spec, spec_lengths = spec.cuda(non_blocking=True), spec_lengths.cuda(non_blocking=True)
-            y, y_lengths = y.cuda(non_blocking=True), y_lengths.cuda(non_blocking=True)
-            speakers = speakers.cuda(non_blocking=True)
-            bert = bert.cuda(non_blocking=True)
-            tone = tone.cuda(non_blocking=True)
-            language = language.cuda(non_blocking=True)
-            style_vec = style_vec.cuda(non_blocking=True)
-            for use_sdp in [True, False]:
-                y_hat, attn, mask, *_ = generator.module.infer(
-                    x,
-                    x_lengths,
-                    speakers,
-                    tone,
-                    language,
-                    bert,
-                    style_vec,
-                    y=spec,
-                    max_len=1000,
-                    sdp_ratio=0.0 if not use_sdp else 1.0,
-                )
-                y_hat_lengths = mask.sum([1, 2]).long() * hps.data.hop_length
-                # 以降のログは計算が重い気がするし誰も見てない気がするのでコメントアウト
-                # mel = spec_to_mel_torch(
-                #     spec,
-                #     hps.data.filter_length,
-                #     hps.data.n_mel_channels,
-                #     hps.data.sampling_rate,
-                #     hps.data.mel_fmin,
-                #     hps.data.mel_fmax,
-                # )
-                # y_hat_mel = mel_spectrogram_torch(
-                #     y_hat.squeeze(1).float(),
-                #     hps.data.filter_length,
-                #     hps.data.n_mel_channels,
-                #     hps.data.sampling_rate,
-                #     hps.data.hop_length,
-                #     hps.data.win_length,
-                #     hps.data.mel_fmin,
-                #     hps.data.mel_fmax,
-                # )
-                # image_dict.update(
-                #     {
-                #         f"gen/mel_{batch_idx}": utils.plot_spectrogram_to_numpy(
-                #             y_hat_mel[0].cpu().numpy()
-                #         )
-                #     }
-                # )
-                # image_dict.update(
-                #     {
-                #         f"gt/mel_{batch_idx}": utils.plot_spectrogram_to_numpy(
-                #             mel[0].cpu().numpy()
-                #         )
-                #     }
-                # )
-                audio_dict.update(
-                    {
-                        f"gen/audio_{batch_idx}_{use_sdp}": y_hat[
-                            0, :, : y_hat_lengths[0]
-                        ]
-                    }
-                )
-                audio_dict.update({f"gt/audio_{batch_idx}": y[0, :, : y_lengths[0]]})
-
-    utils.summarize(
-        writer=writer_eval,
-        global_step=global_step,
-        images=image_dict,
-        audios=audio_dict,
-        audio_sampling_rate=hps.data.sampling_rate,
-    )
-    generator.train()
-
 
 if __name__ == "__main__":
     run()
-"""
-コードを詳細に分析しました。以下の最適化を適用します：
-
-1. `cudnn.benchmark = True` でカーネル自動チューニング
-2. `PYTORCH_CUDA_ALLOC_CONF` でメモリ断片化を削減
-3. DataLoader の `num_workers` 増加 + `prefetch_factor` 復活（GPU飢え解消）
-4. DDP の `bucket_cap_mb` 設定（勾配通信の効率化）
-5. `zero_grad(set_to_none=True)` でメモリ転送削減
-6. `evaluate()` に `non_blocking=True` 追加
-7. `torch.compile` でカーネル融合（PyTorch 2.x）最終確認として主要な変更箇所を検証します。すべての変更を適用しました。以下が変更内容の詳細です。
-
----
-
-## 適用した最適化
-
-### 1. `cudnn.benchmark = True` (行 46)
-cuDNN が最初の数イテレーションで最速のカーネルを自動選択・キャッシュします。DistributedBucketSampler を使っているためバケット内のサイズは一定になりやすく効果が出やすいです。
-
-### 2. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (行 65)
-CUDA メモリアロケータが断片化を起こしにくくなり、OOM リスクと断片化由来のオーバーヘッドを削減します（PyTorch 2.1+）。
-
-### 3. DataLoader の `num_workers` 増加 + `prefetch_factor=2` 復活 (行 243, 266)
-ワーカー数を `cpu_count // 4` に増やし、GPU がバッチ処理を終える前に次のバッチをピン留めメモリへ転送します。これが CPU→GPU 転送待ちによる GPU アイドルの主な解消策です。
-
-### 4. DDP `bucket_cap_mb` 有効化 (行 405〜422)
-`net_g/net_d` を 512 MB、`net_dur_disc/net_wd` を 256 MB に設定。勾配を大きなバケットにまとめてから NCCL 通信するため、マルチ GPU 時の通信オーバーヘッドが減ります。
-
-### 5. `torch.compile` の適用 (行 561〜577)
-チェックポイントロード後・学習開始前に DDP の `.module` に対してコンパイルを適用します。カーネル融合や不要なメモリコピーの除去が行われます。可変長シーケンスがあるため CUDA グラフを使わない `mode="default"` を採用。失敗しても自動スキップします。
-
-### 6. `zero_grad(set_to_none=True)` (行 840, 858, 865, 897)
-勾配テンソルを 0 埋めする代わりに `None` に設定することで、次の backward まで GPU メモリを解放しつつメモリ書き込みオーバーヘッドを排除します。
-
-### 7. `evaluate()` に `non_blocking=True` 追加 (行 1095〜1102)
-訓練ループでは既に設定済みでしたが、evaluate() 側が抜けていたため追加しました。CPU→GPU 転送を CUDA ストリームで非同期化します。
-
----
-
-**注意点**: `num_workers` を上げることでシステム RAM が増加します。RAMが少ない場合は `max(2, ...)` の部分を `1` に下げてください。`torch.compile` は初回エポックの最初の数イテレーションでコンパイル時間がかかりますが、以降は高速化されます。
-"""
