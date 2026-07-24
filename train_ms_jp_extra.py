@@ -675,6 +675,318 @@ def run():
         pbar.close()
 
 
+def _need_grad_norm_log(rank: int, hps, global_step: int) -> bool:
+    """
+    grad_norm_d / grad_norm_g / grad_norm_dur / grad_norm_wd は scalar_dict 経由で
+    TensorBoard に書き込まれる以外の用途では一切使われていない (最適化の挙動には無関係)。
+    そしてその書き込みが実際に行われるのは
+        rank == 0 and global_step % hps.train.log_interval == 0 and not hps.speedup
+    のときだけ (train_and_evaluate 内のロギング条件と全く同じ)。
+    つまり log_interval (デフォルト 200) に 1 回しか使われない値のために、
+    毎ステップ計算するのは無駄である。この関数はその判定を1箇所にまとめたもの。
+    """
+    if rank != 0:
+        return False
+    if getattr(hps, "speedup", False):
+        return False
+    return global_step % hps.train.log_interval == 0
+
+
+def _grad_norm_no_clip(parameters) -> float:
+    """
+    commons.clip_grad_value_(parameters, None) の高速な代替。
+
+    元の commons.clip_grad_value_ は clip_value=None の場合クリップは一切行わず、
+    「ログ用に全パラメータの合計 L2 ノルムを求める」ためだけに、パラメータを1個ずつ
+    ループして `.item()` を呼んでいた (style_bert_vits2/models/commons.py 参照)。
+    `.item()` は GPU の計算完了を待つ同期ポイントであり、これをパラメータ数 (net_g
+    だけで数百個) ぶん繰り返すと、GPU が非同期にキューイングした計算を毎回ストール
+    させてしまい、backward+step 全体の所要時間を支配するボトルネックになっていた。
+
+    torch.nn.utils.clip_grad_norm_ は内部で torch._foreach_norm 等の fused
+    multi-tensor 実装を使い、全パラメータ分の勾配ノルムを少数のカーネル呼び出しで
+    まとめて計算し、`.item()` に相当する同期は最後に一度だけで済む。
+    max_norm=inf を渡すと clip係数は必ず 1.0 になり (1.0倍は浮動小数点として
+    厳密に無演算)、勾配の値そのものは一切変更されない。
+    つまりこの関数は commons.clip_grad_value_(parameters, None) と
+    「クリップはせず、合計ノルムだけ返す」という挙動・戻り値ともに等価であり、
+    高速化以外の副作用はない。
+    """
+    return torch.nn.utils.clip_grad_norm_(parameters, max_norm=float("inf")).item()
+
+
+def run_training_batch(
+    hps,
+    nets,
+    optims,
+    scaler,
+    batch,
+    local_rank,
+    global_step: int,
+    need_grad_norm_log: bool,
+) -> dict:
+    """
+    1バッチ分の最適化ステップ (D / dur_disc / wd / G の forward, backward, step)
+    を実行する。train_and_evaluate のループ本体からロジックをそのまま切り出した
+    もので、計算内容は元の実装と完全に同一 (下記コメントの2箇所の最適化を除く)。
+
+    切り出した目的は2つ:
+      1. train_and_evaluate 自体を読みやすくするため。
+      2. DataLoader / DDP(実体) / logger / writer / tqdm といった周辺設備なしに、
+         この関数単体を直接呼び出してテストできるようにするため。
+         verify_optimization.py はこの関数を新旧2つの train_ms_jp_extra.py から
+         それぞれ import し、同一の入力・同一の初期重みを与えて出力を比較する。
+
+    [最適化 1] grad_norm_* の遅延評価 (need_grad_norm_log)
+        grad_norm_d/g/dur/wd はログ以外に使われないため、ログが必要なステップ
+        だけ計算する (_need_grad_norm_log を参照)。
+
+    [最適化 2] bf16 実行時に GradScaler を経由しない (_backward / _step)
+        GradScaler は fp16 のアンダーフロー対策用の仕組みで、bf16 は fp32 と
+        同じ指数部レンジを持つためスケーリングは本来不要。しかし
+        scaler.step() は最適化対象 (D, dur_disc, wd, G の最大4つ) ごとに
+        found_inf を `.item()` で CPU に同期して確認するため、bf16実行時は
+        毎ステップ最大4回の不要な同期が発生していた。bf16実行時は素の
+        backward()/optimizer.step() に切り替えてこれを取り除く。
+        fp32実行時 (bf16_run=False) は scaler が元々 enabled=False で構築
+        されており scale/unscale/step は実質無演算なので、この分岐によって
+        fp32実行時の挙動が変わることはない。
+
+    Returns:
+        dict: ロギングに必要な loss / grad_norm など一式。
+    """
+    net_g, net_d, net_dur_disc, net_wd, wl = nets
+    optim_g, optim_d, optim_dur_disc, optim_wd = optims
+    (
+        x,
+        x_lengths,
+        spec,
+        spec_lengths,
+        y,
+        y_lengths,
+        speakers,
+        tone,
+        language,
+        bert,
+        style_vec,
+    ) = batch
+
+    use_bf16 = bool(getattr(hps.train, "bf16_run", False))
+
+    def _backward(loss, optimizer):
+        if use_bf16:
+            loss.backward()
+        else:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+
+    def _step(optimizer):
+        if use_bf16:
+            optimizer.step()
+        else:
+            scaler.step(optimizer)
+
+    if net_g.module.use_noise_scaled_mas:
+        current_mas_noise_scale = (
+            net_g.module.mas_noise_scale_initial
+            - net_g.module.noise_scale_delta * global_step
+        )
+        net_g.module.current_mas_noise_scale = max(current_mas_noise_scale, 0.0)
+    x, x_lengths = x.cuda(local_rank, non_blocking=True), x_lengths.cuda(
+        local_rank, non_blocking=True
+    )
+    spec, spec_lengths = spec.cuda(local_rank, non_blocking=True), spec_lengths.cuda(
+        local_rank, non_blocking=True
+    )
+    y, y_lengths = y.cuda(local_rank, non_blocking=True), y_lengths.cuda(
+        local_rank, non_blocking=True
+    )
+    speakers = speakers.cuda(local_rank, non_blocking=True)
+    tone = tone.cuda(local_rank, non_blocking=True)
+    language = language.cuda(local_rank, non_blocking=True)
+    bert = bert.cuda(local_rank, non_blocking=True)
+    style_vec = style_vec.cuda(local_rank, non_blocking=True)
+
+    with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+        (
+            y_hat,
+            l_length,
+            attn,
+            ids_slice,
+            x_mask,
+            z_mask,
+            (z, z_p, m_p, logs_p, m_q, logs_q),
+            (hidden_x, logw, logw_),  # , logw_sdp),
+            g,
+        ) = net_g(
+            x,
+            x_lengths,
+            spec,
+            spec_lengths,
+            speakers,
+            tone,
+            language,
+            bert,
+            style_vec,
+        )
+        mel = spec_to_mel_torch(
+            spec,
+            hps.data.filter_length,
+            hps.data.n_mel_channels,
+            hps.data.sampling_rate,
+            hps.data.mel_fmin,
+            hps.data.mel_fmax,
+        )
+        y_mel = commons.slice_segments(
+            mel, ids_slice, hps.train.segment_size // hps.data.hop_length
+        )
+        y_hat_mel = mel_spectrogram_torch(
+            y_hat.squeeze(1).float(),
+            hps.data.filter_length,
+            hps.data.n_mel_channels,
+            hps.data.sampling_rate,
+            hps.data.hop_length,
+            hps.data.win_length,
+            hps.data.mel_fmin,
+            hps.data.mel_fmax,
+        )
+
+        y = commons.slice_segments(
+            y, ids_slice * hps.data.hop_length, hps.train.segment_size
+        )  # slice
+
+        # Discriminator
+        y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+            loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
+                y_d_hat_r, y_d_hat_g
+            )
+            loss_disc_all = loss_disc
+
+        grad_norm_dur = 0.0
+        loss_dur_disc_all = None
+        losses_dur_disc_r = None
+        losses_dur_disc_g = None
+        if net_dur_disc is not None:
+            y_dur_hat_r, y_dur_hat_g = net_dur_disc(
+                hidden_x.detach(),
+                x_mask.detach(),
+                logw_.detach(),
+                logw.detach(),
+                g.detach(),
+            )
+            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+                # TODO: I think need to mean using the mask, but for now, just mean all
+                (
+                    loss_dur_disc,
+                    losses_dur_disc_r,
+                    losses_dur_disc_g,
+                ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
+                loss_dur_disc_all = loss_dur_disc
+            optim_dur_disc.zero_grad()
+            _backward(loss_dur_disc_all, optim_dur_disc)
+            # torch.nn.utils.clip_grad_norm_(
+            # parameters=net_dur_disc.parameters(), max_norm=5
+            # )
+            if need_grad_norm_log:
+                grad_norm_dur = _grad_norm_no_clip(net_dur_disc.parameters())
+            _step(optim_dur_disc)
+
+        grad_norm_wd = 0.0
+        loss_slm = None
+        if net_wd is not None:
+            # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
+            # shape: (batch, 1, time)
+            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+                loss_slm = wl.discriminator(
+                    y.detach().squeeze(1), y_hat.detach().squeeze(1)
+                ).mean()
+
+            optim_wd.zero_grad()
+            _backward(loss_slm, optim_wd)
+            # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
+            if need_grad_norm_log:
+                grad_norm_wd = _grad_norm_no_clip(net_wd.parameters())
+            _step(optim_wd)
+
+    optim_d.zero_grad()
+    _backward(loss_disc_all, optim_d)
+    if getattr(hps.train, "bf16_run", False):
+        torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
+    grad_norm_d = _grad_norm_no_clip(net_d.parameters()) if need_grad_norm_log else 0.0
+    _step(optim_d)
+
+    with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+        # Generator
+        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+        if net_dur_disc is not None:
+            _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+        loss_lm = None
+        loss_lm_gen = None
+        if net_wd is not None:
+            loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
+            loss_lm_gen = wl.generator(y_hat.squeeze(1))
+        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+            loss_dur = torch.sum(l_length.float())
+            loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+
+            loss_fm = feature_loss(fmap_r, fmap_g)
+            loss_gen, losses_gen = generator_loss(y_d_hat_g)
+            # loss_commit = loss_commit * hps.train.c_commit
+
+            loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+            loss_dur_gen = None
+            losses_dur_gen = None
+            if net_dur_disc is not None:
+                loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
+                if net_wd is not None:
+                    loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
+                else:
+                    loss_gen_all += loss_dur_gen
+    optim_g.zero_grad()
+    _backward(loss_gen_all, optim_g)
+    # if getattr(hps.train, "bf16_run", False):
+    torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
+    grad_norm_g = _grad_norm_no_clip(net_g.parameters()) if need_grad_norm_log else 0.0
+    _step(optim_g)
+    if not use_bf16:
+        # bf16実行時は scaler を一切使っていないため update() は呼ばない。
+        # (使っていない状態で呼ぶと GradScaler 内部で assert に引っかかる:
+        #  "No inf checks were recorded prior to update.")
+        scaler.update()
+
+    return {
+        "y_mel": y_mel,
+        "y_hat_mel": y_hat_mel,
+        "mel": mel,
+        "attn": attn,
+        "loss_disc": loss_disc,
+        "loss_disc_all": loss_disc_all,
+        "losses_disc_r": losses_disc_r,
+        "losses_disc_g": losses_disc_g,
+        "grad_norm_d": grad_norm_d,
+        "loss_gen": loss_gen,
+        "loss_gen_all": loss_gen_all,
+        "losses_gen": losses_gen,
+        "loss_fm": loss_fm,
+        "loss_mel": loss_mel,
+        "loss_dur": loss_dur,
+        "loss_kl": loss_kl,
+        "grad_norm_g": grad_norm_g,
+        "loss_dur_disc_all": loss_dur_disc_all,
+        "losses_dur_disc_r": losses_dur_disc_r,
+        "losses_dur_disc_g": losses_dur_disc_g,
+        "loss_dur_gen": loss_dur_gen,
+        "losses_dur_gen": losses_dur_gen,
+        "grad_norm_dur": grad_norm_dur,
+        "loss_slm": loss_slm,
+        "grad_norm_wd": grad_norm_wd,
+        "loss_lm": loss_lm,
+        "loss_lm_gen": loss_lm_gen,
+    }
+
+
 def train_and_evaluate(
     rank,
     local_rank,
@@ -706,181 +1018,22 @@ def train_and_evaluate(
         net_dur_disc.train()
     if net_wd is not None:
         net_wd.train()
-    for batch_idx, (
-        x,
-        x_lengths,
-        spec,
-        spec_lengths,
-        y,
-        y_lengths,
-        speakers,
-        tone,
-        language,
-        bert,
-        style_vec,
-    ) in enumerate(train_loader):
-        if net_g.module.use_noise_scaled_mas:
-            current_mas_noise_scale = (
-                net_g.module.mas_noise_scale_initial
-                - net_g.module.noise_scale_delta * global_step
-            )
-            net_g.module.current_mas_noise_scale = max(current_mas_noise_scale, 0.0)
-        x, x_lengths = x.cuda(local_rank, non_blocking=True), x_lengths.cuda(
-            local_rank, non_blocking=True
+    for batch_idx, batch in enumerate(train_loader):
+        need_grad_norm_log = _need_grad_norm_log(rank, hps, global_step)
+        step_out = run_training_batch(
+            hps,
+            nets,
+            optims,
+            scaler,
+            batch,
+            local_rank,
+            global_step,
+            need_grad_norm_log,
         )
-        spec, spec_lengths = spec.cuda(
-            local_rank, non_blocking=True
-        ), spec_lengths.cuda(local_rank, non_blocking=True)
-        y, y_lengths = y.cuda(local_rank, non_blocking=True), y_lengths.cuda(
-            local_rank, non_blocking=True
-        )
-        speakers = speakers.cuda(local_rank, non_blocking=True)
-        tone = tone.cuda(local_rank, non_blocking=True)
-        language = language.cuda(local_rank, non_blocking=True)
-        bert = bert.cuda(local_rank, non_blocking=True)
-        style_vec = style_vec.cuda(local_rank, non_blocking=True)
-
-        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-            (
-                y_hat,
-                l_length,
-                attn,
-                ids_slice,
-                x_mask,
-                z_mask,
-                (z, z_p, m_p, logs_p, m_q, logs_q),
-                (hidden_x, logw, logw_),  # , logw_sdp),
-                g,
-            ) = net_g(
-                x,
-                x_lengths,
-                spec,
-                spec_lengths,
-                speakers,
-                tone,
-                language,
-                bert,
-                style_vec,
-            )
-            mel = spec_to_mel_torch(
-                spec,
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax,
-            )
-            y_mel = commons.slice_segments(
-                mel, ids_slice, hps.train.segment_size // hps.data.hop_length
-            )
-            y_hat_mel = mel_spectrogram_torch(
-                y_hat.squeeze(1).float(),
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.hop_length,
-                hps.data.win_length,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax,
-            )
-
-            y = commons.slice_segments(
-                y, ids_slice * hps.data.hop_length, hps.train.segment_size
-            )  # slice
-
-            # Discriminator
-            y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
-                    y_d_hat_r, y_d_hat_g
-                )
-                loss_disc_all = loss_disc
-            if net_dur_disc is not None:
-                y_dur_hat_r, y_dur_hat_g = net_dur_disc(
-                    hidden_x.detach(),
-                    x_mask.detach(),
-                    logw_.detach(),
-                    logw.detach(),
-                    g.detach(),
-                )
-                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                    # TODO: I think need to mean using the mask, but for now, just mean all
-                    (
-                        loss_dur_disc,
-                        losses_dur_disc_r,
-                        losses_dur_disc_g,
-                    ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
-                    loss_dur_disc_all = loss_dur_disc
-                optim_dur_disc.zero_grad()
-                scaler.scale(loss_dur_disc_all).backward()
-                scaler.unscale_(optim_dur_disc)
-                # torch.nn.utils.clip_grad_norm_(
-                # parameters=net_dur_disc.parameters(), max_norm=5
-                # )
-                grad_norm_dur = commons.clip_grad_value_(
-                    net_dur_disc.parameters(), None
-                )
-                scaler.step(optim_dur_disc)
-            if net_wd is not None:
-                # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
-                # shape: (batch, 1, time)
-                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                    loss_slm = wl.discriminator(
-                        y.detach().squeeze(1), y_hat.detach().squeeze(1)
-                    ).mean()
-
-                optim_wd.zero_grad()
-                scaler.scale(loss_slm).backward()
-                scaler.unscale_(optim_wd)
-                # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
-                grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
-                scaler.step(optim_wd)
-
-        optim_d.zero_grad()
-        scaler.scale(loss_disc_all).backward()
-        scaler.unscale_(optim_d)
-        if getattr(hps.train, "bf16_run", False):
-            torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        scaler.step(optim_d)
-
-        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-            # Generator
-            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-            if net_dur_disc is not None:
-                _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
-            if net_wd is not None:
-                loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
-                loss_lm_gen = wl.generator(y_hat.squeeze(1))
-            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
-                loss_dur = torch.sum(l_length.float())
-                loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-
-                loss_fm = feature_loss(fmap_r, fmap_g)
-                loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                # loss_commit = loss_commit * hps.train.c_commit
-
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-                if net_dur_disc is not None:
-                    loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-                    if net_wd is not None:
-                        loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
-                    else:
-                        loss_gen_all += loss_dur_gen
-        optim_g.zero_grad()
-        scaler.scale(loss_gen_all).backward()
-        scaler.unscale_(optim_g)
-        # if getattr(hps.train, "bf16_run", False):
-        torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        scaler.step(optim_g)
-        scaler.update()
 
         if rank == 0:
             if global_step % hps.train.log_interval == 0 and not hps.speedup:
                 lr = optim_g.param_groups[0]["lr"]
-                losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 # logger.info(
                 #     "Train Epoch: {} [{:.0f}%]".format(
                 #         epoch, 100.0 * batch_idx / len(train_loader)
@@ -889,71 +1042,84 @@ def train_and_evaluate(
                 # logger.info([x.item() for x in losses] + [global_step, lr])
 
                 scalar_dict = {
-                    "loss/g/total": loss_gen_all,
-                    "loss/d/total": loss_disc_all,
+                    "loss/g/total": step_out["loss_gen_all"],
+                    "loss/d/total": step_out["loss_disc_all"],
                     "learning_rate": lr,
-                    "grad_norm_d": grad_norm_d,
-                    "grad_norm_g": grad_norm_g,
+                    "grad_norm_d": step_out["grad_norm_d"],
+                    "grad_norm_g": step_out["grad_norm_g"],
                 }
                 scalar_dict.update(
                     {
-                        "loss/g/fm": loss_fm,
-                        "loss/g/mel": loss_mel,
-                        "loss/g/dur": loss_dur,
-                        "loss/g/kl": loss_kl,
+                        "loss/g/fm": step_out["loss_fm"],
+                        "loss/g/mel": step_out["loss_mel"],
+                        "loss/g/dur": step_out["loss_dur"],
+                        "loss/g/kl": step_out["loss_kl"],
                     }
                 )
-                scalar_dict.update({f"loss/g/{i}": v for i, v in enumerate(losses_gen)})
                 scalar_dict.update(
-                    {f"loss/d_r/{i}": v for i, v in enumerate(losses_disc_r)}
+                    {f"loss/g/{i}": v for i, v in enumerate(step_out["losses_gen"])}
                 )
                 scalar_dict.update(
-                    {f"loss/d_g/{i}": v for i, v in enumerate(losses_disc_g)}
+                    {
+                        f"loss/d_r/{i}": v
+                        for i, v in enumerate(step_out["losses_disc_r"])
+                    }
+                )
+                scalar_dict.update(
+                    {
+                        f"loss/d_g/{i}": v
+                        for i, v in enumerate(step_out["losses_disc_g"])
+                    }
                 )
 
                 if net_dur_disc is not None:
-                    scalar_dict.update({"loss/dur_disc/total": loss_dur_disc_all})
+                    scalar_dict.update(
+                        {"loss/dur_disc/total": step_out["loss_dur_disc_all"]}
+                    )
 
                     scalar_dict.update(
                         {
                             f"loss/dur_disc_g/{i}": v
-                            for i, v in enumerate(losses_dur_disc_g)
+                            for i, v in enumerate(step_out["losses_dur_disc_g"])
                         }
                     )
                     scalar_dict.update(
                         {
                             f"loss/dur_disc_r/{i}": v
-                            for i, v in enumerate(losses_dur_disc_r)
+                            for i, v in enumerate(step_out["losses_dur_disc_r"])
                         }
                     )
 
-                    scalar_dict.update({"loss/g/dur_gen": loss_dur_gen})
+                    scalar_dict.update({"loss/g/dur_gen": step_out["loss_dur_gen"]})
                     scalar_dict.update(
-                        {f"loss/g/dur_gen_{i}": v for i, v in enumerate(losses_dur_gen)}
+                        {
+                            f"loss/g/dur_gen_{i}": v
+                            for i, v in enumerate(step_out["losses_dur_gen"])
+                        }
                     )
 
                 if net_wd is not None:
                     scalar_dict.update(
                         {
-                            "loss/wd/total": loss_slm,
-                            "grad_norm_wd": grad_norm_wd,
-                            "loss/g/lm": loss_lm,
-                            "loss/g/lm_gen": loss_lm_gen,
+                            "loss/wd/total": step_out["loss_slm"],
+                            "grad_norm_wd": step_out["grad_norm_wd"],
+                            "loss/g/lm": step_out["loss_lm"],
+                            "loss/g/lm_gen": step_out["loss_lm_gen"],
                         }
                     )
                 # 以降のログは計算が重い気がするし誰も見てない気がするのでコメントアウト
                 # image_dict = {
                 #     "slice/mel_org": utils.plot_spectrogram_to_numpy(
-                #         y_mel[0].data.cpu().numpy()
+                #         step_out["y_mel"][0].data.cpu().numpy()
                 #     ),
                 #     "slice/mel_gen": utils.plot_spectrogram_to_numpy(
-                #         y_hat_mel[0].data.cpu().numpy()
+                #         step_out["y_hat_mel"][0].data.cpu().numpy()
                 #     ),
                 #     "all/mel": utils.plot_spectrogram_to_numpy(
-                #         mel[0].data.cpu().numpy()
+                #         step_out["mel"][0].data.cpu().numpy()
                 #     ),
                 #     "all/attn": utils.plot_alignment_to_numpy(
-                #         attn[0, 0].data.cpu().numpy()
+                #         step_out["attn"][0, 0].data.cpu().numpy()
                 #     ),
                 # }
                 utils.summarize(
