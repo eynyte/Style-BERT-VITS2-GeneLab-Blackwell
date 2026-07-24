@@ -744,6 +744,13 @@ def train_and_evaluate(
         bert,
         style_vec,
     ) in enumerate(train_loader):
+        # 勾配ノルムはログ用のみ。通常ステップでは計測しないことで、GPU 同期を
+        # 発生させない。rank 0 以外はこの値を出力しないため計測不要。
+        log_this_step = (
+            rank == 0
+            and global_step % hps.train.log_interval == 0
+            and not hps.speedup
+        )
         if net_g.module.use_noise_scaled_mas:
             current_mas_noise_scale = (
                 net_g.module.mas_noise_scale_initial
@@ -842,9 +849,6 @@ def train_and_evaluate(
                 # torch.nn.utils.clip_grad_norm_(
                 # parameters=net_dur_disc.parameters(), max_norm=5
                 # )
-                grad_norm_dur = commons.clip_grad_value_(
-                    net_dur_disc.parameters(), None
-                )
                 scaler.step(optim_dur_disc)
             if net_wd is not None:
                 # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
@@ -858,7 +862,10 @@ def train_and_evaluate(
                 scaler.scale(loss_slm).backward()
                 scaler.unscale_(optim_wd)
                 # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
-                grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
+                if log_this_step:
+                    grad_norm_wd = commons.clip_grad_value_(
+                        net_wd.parameters(), None
+                    )
                 scaler.step(optim_wd)
 
         optim_d.zero_grad()
@@ -868,7 +875,8 @@ def train_and_evaluate(
             # fp16/bf16 いずれの混合精度時も、Discriminatorの勾配爆発対策として norm clipping を適用する。
             # 特にfp16はbf16よりダイナミックレンジが狭くNaN化しやすいため、この安全策の意味が大きい。
             torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+        if log_this_step:
+            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
         scaler.step(optim_d)
 
         with autocast(enabled=amp_enabled, dtype=amp_dtype):
@@ -900,12 +908,13 @@ def train_and_evaluate(
         scaler.unscale_(optim_g)
         # if getattr(hps.train, "bf16_run", False):
         torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+        if log_this_step:
+            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
         scaler.step(optim_g)
         scaler.update()
 
         if rank == 0:
-            if global_step % hps.train.log_interval == 0 and not hps.speedup:
+            if log_this_step:
                 lr = optim_g.param_groups[0]["lr"]
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 # logger.info(
