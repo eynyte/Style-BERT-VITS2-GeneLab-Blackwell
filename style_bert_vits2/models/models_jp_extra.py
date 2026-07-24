@@ -966,8 +966,6 @@ class SynthesizerTrn(nn.Module):
         self.current_mas_noise_scale = self.mas_noise_scale_initial
         if self.use_spk_conditioned_encoder and gin_channels > 0:
             self.enc_gin_channels = gin_channels
-        else:
-            self.enc_gin_channels = 0
         self.enc_p = TextEncoder(
             n_vocab,
             inter_channels,
@@ -1097,26 +1095,34 @@ class SynthesizerTrn(nn.Module):
 
         w = attn.sum(2)
 
-        # [fp16 debug] self.sdp に渡る直前の時点で x/x_mask/w/g が既に壊れていないか確認する。
-        # ここで例外が出れば「self.sdpより手前(エンコーダ等)で既にNaN/Infが発生している」と確定する。
-        # ここを通過して尚 self.sdp 内部でクラッシュする場合は、fp32化しても直らない
-        # 何か別の原因(事前学習チェックポイント自体の破損等)を疑う必要がある。
-        _assert_finite(x, "x (pre-sdp)")
-        _assert_finite(x_mask, "x_mask (pre-sdp)")
-        _assert_finite(w, "w (pre-sdp)")
-        _assert_finite(g, "g (pre-sdp)")
+        # [fp16 debug / fix] fp16実行時のみ、self.sdp をfp32で計算し診断チェックも行う。
+        # bf16/fp32実行時はこの介入は不要かつ余計なコストになるため、元の実装のまま通す。
+        fp16_active = (
+            torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+        )
+        if fp16_active:
+            # self.sdp に渡る直前の時点で x/x_mask/w/g が既に壊れていないか確認する。
+            # ここで例外が出れば「self.sdpより手前(エンコーダ等)で既にNaN/Infが発生している」と確定する。
+            # ここを通過して尚 self.sdp 内部でクラッシュする場合は、fp32化しても直らない
+            # 何か別の原因(事前学習チェックポイント自体の破損等)を疑う必要がある。
+            _assert_finite(x, "x (pre-sdp)")
+            _assert_finite(x_mask, "x_mask (pre-sdp)")
+            _assert_finite(w, "w (pre-sdp)")
+            _assert_finite(g, "g (pre-sdp)")
 
-        # StochasticDurationPredictor は正規化フロー内部で exp/log を多用するため、
-        # fp16 autocast 下だと極端な値が容易に inf/NaN 化し、後段の
-        # rational_quadratic_spline で「入力が空集合」エラーを誘発する。
-        # 生成器全体のfp16化とは切り離し、このサブモジュールだけ明示的にfp32で計算する。
-        with autocast(enabled=False):
-            l_length_sdp = self.sdp(
-                x.float(),
-                x_mask.float(),
-                w.float(),
-                g=g.float() if g is not None else None,
-            )
+            # StochasticDurationPredictor は正規化フロー内部で exp/log を多用するため、
+            # fp16 autocast 下だと極端な値が容易に inf/NaN 化し、後段の
+            # rational_quadratic_spline で「入力が空集合」エラーを誘発する。
+            # 生成器全体のfp16化とは切り離し、このサブモジュールだけ明示的にfp32で計算する。
+            with autocast(enabled=False):
+                l_length_sdp = self.sdp(
+                    x.float(),
+                    x_mask.float(),
+                    w.float(),
+                    g=g.float() if g is not None else None,
+                )
+        else:
+            l_length_sdp = self.sdp(x, x_mask, w, g=g)
         l_length_sdp = l_length_sdp / torch.sum(x_mask)
 
         logw_ = torch.log(w + 1e-6) * x_mask
@@ -1175,14 +1181,22 @@ class SynthesizerTrn(nn.Module):
         x, m_p, logs_p, x_mask = self.enc_p(
             x, x_lengths, tone, language, bert, style_vec, g=g
         )
-        # 学習時と同じ理由で、推論時もこのサブモジュールだけfp32で計算する。
-        with autocast(enabled=False):
+        # 学習時と同じ理由で、推論時もfp16実行時のみこのサブモジュールをfp32で計算する。
+        infer_fp16_active = (
+            torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+        )
+        if infer_fp16_active:
+            with autocast(enabled=False):
+                logw_sdp = self.sdp(
+                    x.float(),
+                    x_mask.float(),
+                    g=g.float() if g is not None else None,
+                    reverse=True,
+                    noise_scale=noise_scale_w,
+                )
+        else:
             logw_sdp = self.sdp(
-                x.float(),
-                x_mask.float(),
-                g=g.float() if g is not None else None,
-                reverse=True,
-                noise_scale=noise_scale_w,
+                x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w
             )
         logw = logw_sdp * (sdp_ratio) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
         w = torch.exp(logw) * x_mask * length_scale

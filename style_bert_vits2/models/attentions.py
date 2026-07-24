@@ -127,6 +127,11 @@ class Encoder(nn.Module):
     def forward(
         self, x: torch.Tensor, x_mask: torch.Tensor, g: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        # [fp16 debug] 診断チェックはfp16実行時のみ発動させる(CUDA同期を伴うため
+        # bf16/fp32実行時には余計なオーバーヘッドになる)。
+        fp16_active = (
+            torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+        )
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
         for i in range(self.n_layers):
@@ -137,16 +142,20 @@ class Encoder(nn.Module):
                 x = x + g
                 x = x * x_mask
             y = self.attn_layers[i](x, x, attn_mask)
-            _assert_finite(y, f"encoder layer {i} attn output")
+            if fp16_active:
+                _assert_finite(y, f"encoder layer {i} attn output")
             y = self.drop(y)
             x = self.norm_layers_1[i](x + y)
-            _assert_finite(x, f"encoder layer {i} post-norm1")
+            if fp16_active:
+                _assert_finite(x, f"encoder layer {i} post-norm1")
 
             y = self.ffn_layers[i](x, x_mask)
-            _assert_finite(y, f"encoder layer {i} ffn output")
+            if fp16_active:
+                _assert_finite(y, f"encoder layer {i} ffn output")
             y = self.drop(y)
             x = self.norm_layers_2[i](x + y)
-            _assert_finite(x, f"encoder layer {i} post-norm2")
+            if fp16_active:
+                _assert_finite(x, f"encoder layer {i} post-norm2")
         x = x * x_mask
         return x
 
@@ -324,16 +333,8 @@ class MultiHeadAttention(nn.Module):
         key = key.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
         value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
 
-        # [fp16 debug / fix] 生のQK^Tスコア計算・相対位置バイアスの加算はfp16 autocast下で
-        # 容易にオーバーフローするため(Flash Attention等の融合カーネルと違い、
-        # ここは手書きのmatmul実装で内部の数値安定化がない)、明示的にfp32で計算する。
-        # softmaxまでをfp32区間に収め、その後のvalueとのmatmulはfp16に戻して速度を維持する。
-        with autocast(enabled=False):
-            query_f = query.float()
-            key_f = key.float()
-            scores = torch.matmul(
-                query_f / math.sqrt(self.k_channels), key_f.transpose(-2, -1)
-            )
+        def _compute_scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            scores = torch.matmul(q / math.sqrt(self.k_channels), k.transpose(-2, -1))
             if self.window_size is not None:
                 assert (
                     t_s == t_t
@@ -342,8 +343,8 @@ class MultiHeadAttention(nn.Module):
                     self.emb_rel_k, t_s
                 )
                 rel_logits = self._matmul_with_relative_keys(
-                    query_f / math.sqrt(self.k_channels),
-                    key_relative_embeddings.float(),
+                    q / math.sqrt(self.k_channels),
+                    key_relative_embeddings.to(q.dtype),
                 )
                 scores_local = self._relative_position_to_absolute_position(rel_logits)
                 scores = scores + scores_local
@@ -364,7 +365,23 @@ class MultiHeadAttention(nn.Module):
                         .tril(self.block_length)
                     )
                     scores = scores.masked_fill(block_mask == 0, -1e4)
-            _assert_finite(scores, "attention scores (pre-softmax)")
+            return scores
+
+        # [fp16 debug / fix] 生のQK^Tスコア計算・相対位置バイアスの加算はfp16 autocast下で
+        # 容易にオーバーフローするため(Flash Attention等の融合カーネルと違い、
+        # ここは手書きのmatmul実装で内部の数値安定化がない)、明示的にfp32で計算する。
+        # bf16/fp32実行時はこの介入自体が不要かつ余計なコストになるため、
+        # fp16が実際に有効な場合のみ発動させ、それ以外は元の実装と完全に同じ経路を通す。
+        fp16_active = (
+            torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+        )
+        if fp16_active:
+            with autocast(enabled=False):
+                scores = _compute_scores(query.float(), key.float())
+                _assert_finite(scores, "attention scores (pre-softmax)")
+                p_attn = F.softmax(scores, dim=-1)  # [b, n_h, t_t, t_s]
+        else:
+            scores = _compute_scores(query, key)
             p_attn = F.softmax(scores, dim=-1)  # [b, n_h, t_t, t_s]
         p_attn = self.drop(p_attn)
         output = torch.matmul(p_attn, value)
