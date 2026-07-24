@@ -3,7 +3,7 @@
 コードと完全に一致している保証はない。あくまで参考程度とすること。
 """
 
-from typing import Any, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 import torch
 from torch.nn import functional as F
@@ -190,7 +190,7 @@ def generate_path(duration: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 def clip_grad_value_(
-    parameters: Union[torch.Tensor, list[torch.Tensor]],
+    parameters: Union[torch.Tensor, Iterable[torch.Tensor]],
     clip_value: Optional[float],
     norm_type: float = 2.0,
 ) -> float:
@@ -198,7 +198,7 @@ def clip_grad_value_(
     勾配の値をクリップする
 
     Args:
-        parameters (Union[torch.Tensor, list[torch.Tensor]]): クリップするパラメータ
+        parameters (Union[torch.Tensor, Iterable[torch.Tensor]]): クリップするパラメータ
         clip_value (Optional[float]): クリップする値。None の場合はクリップしない
         norm_type (float): ノルムの種類
 
@@ -212,12 +212,20 @@ def clip_grad_value_(
     if clip_value is not None:
         clip_value = float(clip_value)
 
-    total_norm = 0.0
-    for p in parameters:
-        assert p.grad is not None
-        param_norm = p.grad.data.norm(norm_type)
-        total_norm += param_norm.item() ** norm_type
-        if clip_value is not None:
-            p.grad.data.clamp_(min=-clip_value, max=clip_value)
-    total_norm = total_norm ** (1.0 / norm_type)
-    return total_norm
+    if not parameters:
+        return 0.0
+
+    grads = [p.grad for p in parameters]
+    assert all(grad is not None for grad in grads)
+    grads = [grad for grad in grads if grad is not None]
+
+    # foreach 演算にまとめることで、パラメータごとの .item() による GPU 同期を
+    # 避ける。戻り値を Python float にする最後の .item() だけが同期点になる。
+    grad_norms = torch._foreach_norm(grads, norm_type)
+    total_norm = torch.linalg.vector_norm(torch.stack(grad_norms), norm_type)
+
+    if clip_value is not None:
+        torch._foreach_clamp_min_(grads, -clip_value)
+        torch._foreach_clamp_max_(grads, clip_value)
+
+    return total_norm.item()
