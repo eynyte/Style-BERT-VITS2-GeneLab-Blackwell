@@ -51,9 +51,20 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.min_text_len = getattr(hparams, "min_text_len", 1)
         self.max_text_len = getattr(hparams, "max_text_len", 384)
 
+        # __init__時に全サンプルをメモリへプリロードするかどうか。
+        # HyperParametersData 側に preload_all_to_memory が無い場合は False 扱い。
+        self.preload_all_to_memory = getattr(
+            #hparams, "preload_all_to_memory", False
+            hparams, "preload_all_to_memory", True
+        )
+        self.cache: list = []
+
         random.seed(1234)
         random.shuffle(self.audiopaths_sid_text)
         self._filter()
+
+        if self.preload_all_to_memory:
+            self._preload()
 
     def _filter(self):
         """
@@ -90,7 +101,35 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.audiopaths_sid_text = audiopaths_sid_text_new
         self.lengths = lengths
 
-    def get_audio_text_speaker_pair(self, audiopath_sid_text):
+    def _preload(self):
+        """
+        __init__時に全サンプル（音声・スペクトログラム・BERT特徴量・スタイルベクトル）を
+        あらかじめデシリアライズしてメモリ上のリストに保持しておく。
+        これにより __getitem__ 時のファイルI/O・torch.load/np.loadのデコードコストがなくなる。
+        """
+        logger.info("Preloading all samples into memory (this may take a while)...")
+        self.cache = [None] * len(self.audiopaths_sid_text)
+        failed = 0
+        for i in tqdm(
+            range(len(self.audiopaths_sid_text)), file=sys.stdout, dynamic_ncols=True
+        ):
+            try:
+                self.cache[i] = self._load_sample(self.audiopaths_sid_text[i])
+            except Exception as e:
+                failed += 1
+                logger.warning(f"Failed to preload sample {i}: {e}")
+                self.cache[i] = None
+        logger.info(
+            f"Preload finished: {len(self.cache) - failed}/{len(self.cache)} samples "
+            f"loaded into memory ({failed} failed, will fall back to on-the-fly loading)."
+        )
+
+    def _load_sample(self, audiopath_sid_text):
+        """
+        1サンプル分を実際にディスク（または /dev/shm 等）から読み込み、
+        get_audio_text_speaker_pair が返すのと同じ形式のタプルを構築する。
+        通常の都度読み込みとプリロード（_preload）の両方から呼ばれる共通処理。
+        """
         # separate filename, speaker_id and text
         audiopath, sid, language, text, phones, tone, word2ph = audiopath_sid_text
 
@@ -116,6 +155,15 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 en_bert,
                 style_vec,
             )
+
+    def get_audio_text_speaker_pair(self, audiopath_sid_text, index=None):
+        # プリロード済みキャッシュがあればそれを返す（ファイルI/O・デコードを省略）
+        if self.preload_all_to_memory and index is not None:
+            cached = self.cache[index]
+            if cached is not None:
+                return cached
+            # プリロードに失敗していたサンプルはここで都度読み込みにフォールバック
+        return self._load_sample(audiopath_sid_text)
 
     def get_audio(self, filename):
         audio, sampling_rate = load_wav_to_torch(filename)
@@ -196,7 +244,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         return sid
 
     def __getitem__(self, index):
-        return self.get_audio_text_speaker_pair(self.audiopaths_sid_text[index])
+        return self.get_audio_text_speaker_pair(
+            self.audiopaths_sid_text[index], index=index
+        )
 
     def __len__(self):
         return len(self.audiopaths_sid_text)
