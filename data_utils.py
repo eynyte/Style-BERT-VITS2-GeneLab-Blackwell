@@ -19,6 +19,30 @@ from style_bert_vits2.nlp import cleaned_text_to_sequence
 config = get_config()
 """Multi speaker version"""
 
+# ------------------------------------------------------------------------
+# [カスタム改変] 記号(？/！/「 等)による疑似話者切り替えのための対応
+# ------------------------------------------------------------------------
+# True にすると、話者ごとの本物の (発話固有の) style vector を使う代わりに、
+# 「推論時に Neutral として使われるのと同じ、話者全体の平均 style vector」を
+# 全サンプルに定数として与える。
+#
+# 通常このスクリプトは f"{audiopath}.npy" (pyannote 由来の話者性を色濃く含む
+# xvector) を発話ごとにロードして TextEncoder に渡している。sid を全発話で
+# 同一 (例: 全員 "mix") にしても、この per-utterance の style vector に
+# 話者を区別する情報がそのまま残ってしまうと、モデルは (学習時にしか
+# 存在しない) この抜け道に頼って損失を下げてしまい、テキスト内容
+# (音素列・トーン・BERT特徴、たとえば文頭の ？/！/「 のような記号) を
+# 手がかりにする経路を学習しない可能性が高い。
+#
+# 推論時は style_vectors.npy の Neutral (=話者全体の平均) 1本しか
+# 存在しないため、学習時もそれと同じ「全発話平均」の定数ベクトルに
+# 差し替えることで、この抜け道を塞ぎ、テキスト内容だけが話者を
+# 区別できる唯一の手がかりになるようにする。
+#
+# 通常通り「話者ごとに意味のある個別 style vector を使いたい」学習に
+# 戻す場合は False にすること。
+USE_CONSTANT_STYLE_VEC = True
+
 
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     """
@@ -51,20 +75,42 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.min_text_len = getattr(hparams, "min_text_len", 1)
         self.max_text_len = getattr(hparams, "max_text_len", 384)
 
-        # __init__時に全サンプルをメモリへプリロードするかどうか。
-        # HyperParametersData 側に preload_all_to_memory が無い場合は False 扱い。
-        self.preload_all_to_memory = getattr(
-            #hparams, "preload_all_to_memory", False
-            hparams, "preload_all_to_memory", True
-        )
-        self.cache: list = []
-
         random.seed(1234)
         random.shuffle(self.audiopaths_sid_text)
         self._filter()
 
-        if self.preload_all_to_memory:
-            self._preload()
+        self._const_style_vec = None
+        if USE_CONSTANT_STYLE_VEC:
+            self._const_style_vec = self._load_or_compute_const_style_vec()
+
+    def _load_or_compute_const_style_vec(self) -> "torch.Tensor":
+        """
+        [カスタム改変] 学習時に全サンプルへ与える、定数の style vector を用意する。
+
+        train_ms_jp_extra.py は学習ループに入る前に default_style.save_styles_by_dirs()
+        を呼び、config.out_dir/style_vectors.npy の 0 行目に「全発話の平均 (Neutral)」を
+        保存している (これは推論時に実際に使われるものと同一)。これが存在すればそれを
+        最優先で使い、存在しない場合 (--skip_default_style 指定時や、このローダーを
+        単体で使う場合など) は、手元のデータセットから同じ計算をフォールバックとして
+        行う。
+        """
+        style_vectors_path = os.path.join(str(config.out_dir), "style_vectors.npy")
+        if os.path.exists(style_vectors_path):
+            mean_vec = np.load(style_vectors_path)[0]
+            logger.info(
+                f"[USE_CONSTANT_STYLE_VEC] {style_vectors_path} の Neutral (0行目) を"
+                "学習用の固定 style vector として使用します。"
+            )
+        else:
+            logger.warning(
+                f"[USE_CONSTANT_STYLE_VEC] {style_vectors_path} が見つからないため、"
+                "データセット内の *.npy から平均 style vector をその場で計算します。"
+            )
+            all_vecs = [
+                np.load(f"{item[0]}.npy") for item in self.audiopaths_sid_text
+            ]
+            mean_vec = np.mean(np.stack(all_vecs, axis=0), axis=0)
+        return torch.FloatTensor(mean_vec)
 
     def _filter(self):
         """
@@ -101,35 +147,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.audiopaths_sid_text = audiopaths_sid_text_new
         self.lengths = lengths
 
-    def _preload(self):
-        """
-        __init__時に全サンプル（音声・スペクトログラム・BERT特徴量・スタイルベクトル）を
-        あらかじめデシリアライズしてメモリ上のリストに保持しておく。
-        これにより __getitem__ 時のファイルI/O・torch.load/np.loadのデコードコストがなくなる。
-        """
-        logger.info("Preloading all samples into memory (this may take a while)...")
-        self.cache = [None] * len(self.audiopaths_sid_text)
-        failed = 0
-        for i in tqdm(
-            range(len(self.audiopaths_sid_text)), file=sys.stdout, dynamic_ncols=True
-        ):
-            try:
-                self.cache[i] = self._load_sample(self.audiopaths_sid_text[i])
-            except Exception as e:
-                failed += 1
-                logger.warning(f"Failed to preload sample {i}: {e}")
-                self.cache[i] = None
-        logger.info(
-            f"Preload finished: {len(self.cache) - failed}/{len(self.cache)} samples "
-            f"loaded into memory ({failed} failed, will fall back to on-the-fly loading)."
-        )
-
-    def _load_sample(self, audiopath_sid_text):
-        """
-        1サンプル分を実際にディスク（または /dev/shm 等）から読み込み、
-        get_audio_text_speaker_pair が返すのと同じ形式のタプルを構築する。
-        通常の都度読み込みとプリロード（_preload）の両方から呼ばれる共通処理。
-        """
+    def get_audio_text_speaker_pair(self, audiopath_sid_text):
         # separate filename, speaker_id and text
         audiopath, sid, language, text, phones, tone, word2ph = audiopath_sid_text
 
@@ -139,7 +157,12 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         spec, wav = self.get_audio(audiopath)
         sid = torch.LongTensor([int(self.spk_map[sid])])
-        style_vec = torch.FloatTensor(np.load(f"{audiopath}.npy"))
+        if USE_CONSTANT_STYLE_VEC:
+            # [カスタム改変] 発話固有の (話者性が漏れる) xvector ではなく、
+            # __init__ で用意した固定の平均 style vector を使う。
+            style_vec = self._const_style_vec
+        else:
+            style_vec = torch.FloatTensor(np.load(f"{audiopath}.npy"))
         if self.use_jp_extra:
             return (phones, spec, wav, sid, tone, language, ja_bert, style_vec)
         else:
@@ -155,15 +178,6 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 en_bert,
                 style_vec,
             )
-
-    def get_audio_text_speaker_pair(self, audiopath_sid_text, index=None):
-        # プリロード済みキャッシュがあればそれを返す（ファイルI/O・デコードを省略）
-        if self.preload_all_to_memory and index is not None:
-            cached = self.cache[index]
-            if cached is not None:
-                return cached
-            # プリロードに失敗していたサンプルはここで都度読み込みにフォールバック
-        return self._load_sample(audiopath_sid_text)
 
     def get_audio(self, filename):
         audio, sampling_rate = load_wav_to_torch(filename)
@@ -244,9 +258,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         return sid
 
     def __getitem__(self, index):
-        return self.get_audio_text_speaker_pair(
-            self.audiopaths_sid_text[index], index=index
-        )
+        return self.get_audio_text_speaker_pair(self.audiopaths_sid_text[index])
 
     def __len__(self):
         return len(self.audiopaths_sid_text)
