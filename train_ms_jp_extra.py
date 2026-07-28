@@ -892,11 +892,75 @@ def train_and_evaluate(
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
 
+                # ------------------------------------------------------------------
+                # [A: 学習ループ改造] 事前分布(m_p, logs_p)経由の「テキスト内容だけ
+                # からの再構成」にも直接、再構成ロスを掛ける。
+                #
+                # 通常このスクリプトが最適化する再構成ロス(loss_mel)は Posterior
+                # Encoder経由 (本物の音声 -> z) の teacher-forcing 経路のみを通る。
+                # 一方、推論時に実際に使われる経路 (事前分布 -> flow(reverse) ->
+                # decoder) は、KL項によって「分布の統計的な近さ」を要求されるだけで、
+                # 「flow/decoderがそれを正しく音声として復元できるか」は学習中
+                # 一度も直接検証・強化されない。
+                #
+                # ここでは、この時点で既に真のアライメントで音声フレーム長に
+                # 整列済みの m_p / logs_p (推論時に z_p をサンプリングする元になる
+                # のと全く同じテンソル) を再パラメータ化トリックでサンプリングし、
+                # 学習済みの flow(逆変換)・decoder にそのまま通して得た波形を、
+                # 同じ区間の本物の音声 (y_mel) と比較する。
+                # モデル本体 (models_jp_extra.py) は一切改変せず、既存の
+                # net_g.flow / net_g.dec をもう一度呼び出しているだけ。
+                z_p_prior = m_p + torch.randn_like(m_p) * torch.exp(logs_p)
+                net_g_raw = net_g.module if hasattr(net_g, "module") else net_g
+                z_from_prior = net_g_raw.flow(z_p_prior, z_mask, g=g, reverse=True)
+                z_from_prior_slice = commons.slice_segments(
+                    z_from_prior,
+                    ids_slice,
+                    hps.train.segment_size // hps.data.hop_length,
+                )
+                y_hat_from_prior = net_g_raw.dec(z_from_prior_slice, g=g)
+                y_hat_from_prior_mel = mel_spectrogram_torch(
+                    y_hat_from_prior.squeeze(1).float(),
+                    hps.data.filter_length,
+                    hps.data.n_mel_channels,
+                    hps.data.sampling_rate,
+                    hps.data.hop_length,
+                    hps.data.win_length,
+                    hps.data.mel_fmin,
+                    hps.data.mel_fmax,
+                )
+                # 重みは config の train.c_mel_prior で上書き可能 (未指定なら c_mel の半分)。
+                # NOTE: この経路は flow を reverse (逆変換) 方向で通すため、通常の
+                # forward 方向と数値的な挙動が異なる場合がある。fp16実行時にこの
+                # 項だけ NaN/Inf が出る場合は、self.sdp と同様にこのブロックだけ
+                # autocast(enabled=False) で fp32 実行することを検討すること。
+                c_mel_prior = getattr(hps.train, "c_mel_prior", hps.train.c_mel * 0.5)
+                # torch.nan_to_num は GPU 同期を発生させないため、log_this_step に
+                # 関わらず常時これで安全側に倒す (この fork は他所でも GPU 同期を
+                # 避ける方針のため、それに合わせる)。頻発する場合は fp32 固定を検討。
+                loss_mel_prior = (
+                    torch.nan_to_num(
+                        F.l1_loss(y_mel, y_hat_from_prior_mel),
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    )
+                    * c_mel_prior
+                )
+                # ------------------------------------------------------------------
+
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
                 # loss_commit = loss_commit * hps.train.c_commit
 
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+                loss_gen_all = (
+                    loss_gen
+                    + loss_fm
+                    + loss_mel
+                    + loss_dur
+                    + loss_kl
+                    + loss_mel_prior
+                )
                 if net_dur_disc is not None:
                     loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
                     if net_wd is not None:
@@ -937,6 +1001,7 @@ def train_and_evaluate(
                         "loss/g/mel": loss_mel,
                         "loss/g/dur": loss_dur,
                         "loss/g/kl": loss_kl,
+                        "loss/g/mel_prior": loss_mel_prior,
                     }
                 )
                 scalar_dict.update({f"loss/g/{i}": v for i, v in enumerate(losses_gen)})
