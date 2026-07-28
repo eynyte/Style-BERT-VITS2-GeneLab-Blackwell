@@ -906,12 +906,34 @@ def train_and_evaluate(
                 # ここでは、この時点で既に真のアライメントで音声フレーム長に
                 # 整列済みの m_p / logs_p (推論時に z_p をサンプリングする元になる
                 # のと全く同じテンソル) を再パラメータ化トリックでサンプリングし、
-                # 学習済みの flow(逆変換)・decoder にそのまま通して得た波形を、
+                # 既存の flow(逆変換)・decoder にそのまま通して得た波形を、
                 # 同じ区間の本物の音声 (y_mel) と比較する。
-                # モデル本体 (models_jp_extra.py) は一切改変せず、既存の
-                # net_g.flow / net_g.dec をもう一度呼び出しているだけ。
-                z_p_prior = m_p + torch.randn_like(m_p) * torch.exp(logs_p)
+                #
+                # [重要] flow / decoder 自身の重みはこのロスでは更新しない
+                # (勾配は m_p/logs_p = TextEncoder 側にだけ伝える)。
+                # y_hat (通常経路) は GAN (discriminator + feature loss) で
+                # きちんとバランスされた目的関数で学習されているが、この
+                # loss_mel_prior は L1 のみで GAN の裏付けがない。もし
+                # flow/decoderの重み自体をこれで更新すると、両経路で重みを
+                # 共有しているせいで通常経路(y_hat)の音質まで巻き込んで
+                # 劣化させてしまう(ロボットっぽい/かすれた音になりやすい、
+                # L1のみのvocoder学習でよく起きる典型的な症状)。
+                # あくまで「今のflow/decoderで正しくデコードできる
+                # m_p/logs_pをTextEncoderに作らせる」ことだけが目的なので、
+                # flow/decoder側はrequires_grad=Falseにして凍結する。
                 net_g_raw = net_g.module if hasattr(net_g, "module") else net_g
+                _frozen_params = list(net_g_raw.flow.parameters()) + list(
+                    net_g_raw.dec.parameters()
+                )
+                for p in _frozen_params:
+                    p.requires_grad_(False)
+
+                # noise_scale も推論時のデフォルト(DEFAULT_NOISE=0.6)に合わせ、
+                # 分散1.0のフルノイズより現実的な(inferenceに近い)サンプルにする。
+                prior_noise_scale = getattr(hps.train, "prior_noise_scale", 0.6)
+                z_p_prior = (
+                    m_p + torch.randn_like(m_p) * torch.exp(logs_p) * prior_noise_scale
+                )
                 z_from_prior = net_g_raw.flow(z_p_prior, z_mask, g=g, reverse=True)
                 z_from_prior_slice = commons.slice_segments(
                     z_from_prior,
@@ -929,6 +951,10 @@ def train_and_evaluate(
                     hps.data.mel_fmin,
                     hps.data.mel_fmax,
                 )
+
+                for p in _frozen_params:
+                    p.requires_grad_(True)
+
                 # 重みは config の train.c_mel_prior で上書き可能 (未指定なら c_mel の半分)。
                 # NOTE: この経路は flow を reverse (逆変換) 方向で通すため、通常の
                 # forward 方向と数値的な挙動が異なる場合がある。fp16実行時にこの
