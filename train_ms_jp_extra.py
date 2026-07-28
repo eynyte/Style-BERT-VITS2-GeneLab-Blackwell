@@ -928,9 +928,12 @@ def train_and_evaluate(
                 for p in _frozen_params:
                     p.requires_grad_(False)
 
-                # noise_scale も推論時のデフォルト(DEFAULT_NOISE=0.6)に合わせ、
-                # 分散1.0のフルノイズより現実的な(inferenceに近い)サンプルにする。
-                prior_noise_scale = getattr(hps.train, "prior_noise_scale", 0.6)
+                # noise_scale も推論時のデフォルト(DEFAULT_NOISE=0.6)を基準にしつつ、
+                # 少し弱め(0.5)にしておく。ここのノイズは m_p/logs_p の中の
+                # 音素の細かい違いを表す次元にもかかる(logs_pが大きければその分
+                # 強く乗る)ため、大きすぎると内容(発音)の精度を余計に乱す方向に
+                # 働きうる。
+                prior_noise_scale = getattr(hps.train, "prior_noise_scale", 0.5)
                 z_p_prior = (
                     m_p + torch.randn_like(m_p) * torch.exp(logs_p) * prior_noise_scale
                 )
@@ -955,12 +958,22 @@ def train_and_evaluate(
                 for p in _frozen_params:
                     p.requires_grad_(True)
 
-                # 重みは config の train.c_mel_prior で上書き可能 (未指定なら c_mel の半分)。
+                # 重みは config の train.c_mel_prior で上書き可能。
+                #
+                # [重要] デフォルトを c_mel(=45) 基準の c_mel*0.5 (=22.5) から、
+                # c_kl(=1.0) 基準の c_kl*5 (=5.0) に変更した。
+                # 敬語/タメ口は c_kl=1.0 の勾配だけで綺麗に分離できていた実績が
+                # あるので、それより弱い記号のような手がかりを拾わせるのに
+                # 必要なのは「c_kl比で何倍か強める」程度で十分なはず。
+                # 前回の c_mel*0.5=22.5 は c_kl の20倍以上強く、KLが本来担って
+                # いた「精密な内容(音素)エンコード」の勾配をこの荒い
+                # (stochastic samplingに基づく高分散な) L1ロスが押し潰して
+                # しまい、バ/ダのような近い音素同士の混同を招いたと考えられる。
                 # NOTE: この経路は flow を reverse (逆変換) 方向で通すため、通常の
                 # forward 方向と数値的な挙動が異なる場合がある。fp16実行時にこの
                 # 項だけ NaN/Inf が出る場合は、self.sdp と同様にこのブロックだけ
                 # autocast(enabled=False) で fp32 実行することを検討すること。
-                c_mel_prior = getattr(hps.train, "c_mel_prior", hps.train.c_mel * 0.5)
+                c_mel_prior = getattr(hps.train, "c_mel_prior", hps.train.c_kl * 5.0)
                 # torch.nan_to_num は GPU 同期を発生させないため、log_this_step に
                 # 関わらず常時これで安全側に倒す (この fork は他所でも GPU 同期を
                 # 避ける方針のため、それに合わせる)。頻発する場合は fp32 固定を検討。
