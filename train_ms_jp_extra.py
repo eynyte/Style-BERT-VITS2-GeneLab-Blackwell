@@ -549,19 +549,7 @@ def run():
     else:
         scheduler_wd = None
         wl = None
-    if hps.train.fp16_run and hps.train.bf16_run:
-        logger.warning(
-            "Both fp16_run and bf16_run are set to True in config.json; fp16_run takes precedence."
-        )
-    if hps.train.fp16_run:
-        logger.info("Mixed precision training: fp16 (GradScaler enabled)")
-    elif hps.train.bf16_run:
-        logger.info("Mixed precision training: bf16")
-    else:
-        logger.info("Mixed precision training: disabled (fp32)")
-    # GradScaler は fp16 の勾配アンダーフロー対策としてのみ必要。
-    # bf16 は fp32 相当の指数レンジを持つため scaler は不要 (enabled=False で問題ない)。
-    scaler = GradScaler(enabled=hps.train.fp16_run)
+    scaler = GradScaler(enabled=hps.train.bf16_run)
     logger.info("Start training.")
 
     diff = abs(
@@ -712,19 +700,6 @@ def train_and_evaluate(
     # train_loader.batch_sampler.set_epoch(epoch)
     global global_step
 
-    # 混合精度モードの決定: bf6_run を優先し、次に fp16_run、両方 False なら fp32 (AMP無効)。
-    # T4 (Turing, sm_75) は bf16 の Tensor Core 演算に対応していないため、
-    # T4環境では config.json で fp16_run: true を指定することを推奨する。
-    if hps.train.bf16_run:
-        amp_dtype = torch.bfloat16
-        amp_enabled = True
-    elif hps.train.fp16_run:
-        amp_dtype = torch.float16
-        amp_enabled = True
-    else:
-        amp_dtype = torch.float32
-        amp_enabled = False
-
     net_g.train()
     net_d.train()
     if net_dur_disc is not None:
@@ -744,13 +719,6 @@ def train_and_evaluate(
         bert,
         style_vec,
     ) in enumerate(train_loader):
-        # 勾配ノルムはログ用のみ。通常ステップでは計測しないことで、GPU 同期を
-        # 発生させない。rank 0 以外はこの値を出力しないため計測不要。
-        log_this_step = (
-            rank == 0
-            and global_step % hps.train.log_interval == 0
-            and not hps.speedup
-        )
         if net_g.module.use_noise_scaled_mas:
             current_mas_noise_scale = (
                 net_g.module.mas_noise_scale_initial
@@ -772,7 +740,7 @@ def train_and_evaluate(
         bert = bert.cuda(local_rank, non_blocking=True)
         style_vec = style_vec.cuda(local_rank, non_blocking=True)
 
-        with autocast(enabled=amp_enabled, dtype=amp_dtype):
+        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
             (
                 y_hat,
                 l_length,
@@ -822,7 +790,7 @@ def train_and_evaluate(
 
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-            with autocast(enabled=amp_enabled, dtype=amp_dtype):
+            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                     y_d_hat_r, y_d_hat_g
                 )
@@ -835,7 +803,7 @@ def train_and_evaluate(
                     logw.detach(),
                     g.detach(),
                 )
-                with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
                     # TODO: I think need to mean using the mask, but for now, just mean all
                     (
                         loss_dur_disc,
@@ -849,11 +817,14 @@ def train_and_evaluate(
                 # torch.nn.utils.clip_grad_norm_(
                 # parameters=net_dur_disc.parameters(), max_norm=5
                 # )
+                grad_norm_dur = commons.clip_grad_value_(
+                    net_dur_disc.parameters(), None
+                )
                 scaler.step(optim_dur_disc)
             if net_wd is not None:
                 # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
                 # shape: (batch, 1, time)
-                with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
                     loss_slm = wl.discriminator(
                         y.detach().squeeze(1), y_hat.detach().squeeze(1)
                     ).mean()
@@ -862,24 +833,18 @@ def train_and_evaluate(
                 scaler.scale(loss_slm).backward()
                 scaler.unscale_(optim_wd)
                 # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
-                if log_this_step:
-                    grad_norm_wd = commons.clip_grad_value_(
-                        net_wd.parameters(), None
-                    )
+                grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
                 scaler.step(optim_wd)
 
         optim_d.zero_grad()
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
-        if amp_enabled:
-            # fp16/bf16 いずれの混合精度時も、Discriminatorの勾配爆発対策として norm clipping を適用する。
-            # 特にfp16はbf16よりダイナミックレンジが狭くNaN化しやすいため、この安全策の意味が大きい。
+        if getattr(hps.train, "bf16_run", False):
             torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
-        if log_this_step:
-            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
         scaler.step(optim_d)
 
-        with autocast(enabled=amp_enabled, dtype=amp_dtype):
+        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
             if net_dur_disc is not None:
@@ -887,7 +852,7 @@ def train_and_evaluate(
             if net_wd is not None:
                 loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
                 loss_lm_gen = wl.generator(y_hat.squeeze(1))
-            with autocast(enabled=amp_enabled, dtype=amp_dtype):
+            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
                 loss_dur = torch.sum(l_length.float())
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
@@ -906,17 +871,14 @@ def train_and_evaluate(
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
-        if amp_enabled:
-            # Discriminator側と同様、fp16/bf16 いずれの混合精度時も
-            # Generatorの勾配爆発対策として norm clipping を適用する(fp32時は元の挙動通り適用しない)。
-            torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
-        if log_this_step:
-            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+        # if getattr(hps.train, "bf16_run", False):
+        torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
+        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
         scaler.step(optim_g)
         scaler.update()
 
         if rank == 0:
-            if log_this_step:
+            if global_step % hps.train.log_interval == 0 and not hps.speedup:
                 lr = optim_g.param_groups[0]["lr"]
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 # logger.info(
