@@ -712,14 +712,14 @@ def train_and_evaluate(
     # train_loader.batch_sampler.set_epoch(epoch)
     global global_step
 
-    # 混合精度モードの決定: fp16_run を優先し、次に bf16_run、両方 False なら fp32 (AMP無効)。
+    # 混合精度モードの決定: bf6_run を優先し、次に fp16_run、両方 False なら fp32 (AMP無効)。
     # T4 (Turing, sm_75) は bf16 の Tensor Core 演算に対応していないため、
     # T4環境では config.json で fp16_run: true を指定することを推奨する。
-    if hps.train.fp16_run:
-        amp_dtype = torch.float16
-        amp_enabled = True
-    elif hps.train.bf16_run:
+    if hps.train.bf16_run:
         amp_dtype = torch.bfloat16
+        amp_enabled = True
+    elif hps.train.fp16_run:
+        amp_dtype = torch.float16
         amp_enabled = True
     else:
         amp_dtype = torch.float32
@@ -906,8 +906,10 @@ def train_and_evaluate(
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
-        # if getattr(hps.train, "bf16_run", False):
-        torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
+        if amp_enabled:
+            # Discriminator側と同様、fp16/bf16 いずれの混合精度時も
+            # Generatorの勾配爆発対策として norm clipping を適用する(fp32時は元の挙動通り適用しない)。
+            torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
         if log_this_step:
             grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
         scaler.step(optim_g)
