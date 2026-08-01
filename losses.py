@@ -15,6 +15,16 @@ def feature_loss(fmap_r, fmap_g):
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    """
+    r_losses, g_losses はログ記録 (TensorBoard) 専用に使われる値であり、
+    通常ステップ (log_this_step=False) では捨てられる。
+    そのため、ここでは常に .item() を呼ばずテンソルのまま返す。
+    .item() は GPU->CPU 同期を強制するため、これを毎ステップ呼ぶと
+    ログを取らないステップでも無駄な同期コストを払うことになり、
+    特に1ステップの計算時間が短い/同期レイテンシに敏感な環境
+    (例: 一部のクラウド上のH100/B200/B300など) で顕著なオーバーヘッドになりうる。
+    値が実際に必要な呼び出し側 (ログ記録時のみ) で .item() すること。
+    """
     loss = 0
     r_losses = []
     g_losses = []
@@ -24,8 +34,8 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
         r_loss = torch.mean((1 - dr) ** 2)
         g_loss = torch.mean(dg**2)
         loss += r_loss + g_loss
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
+        r_losses.append(r_loss)  # .item() を呼ばずテンソルのまま格納
+        g_losses.append(g_loss)  # .item() を呼ばずテンソルのまま格納
 
     return loss, r_losses, g_losses
 
