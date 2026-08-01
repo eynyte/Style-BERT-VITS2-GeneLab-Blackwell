@@ -10,6 +10,7 @@ from huggingface_hub import HfApi
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.profiler import ProfilerActivity, profile, record_function  # DIAG PATCH
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -731,6 +732,18 @@ def train_and_evaluate(
         net_dur_disc.train()
     if net_wd is not None:
         net_wd.train()
+    # ==== DIAG PATCH: torch.profiler を手動start/stopで仕込む ====
+    # start()/stop()方式を使うことで、既存のforループのインデントを一切変更せずに済む。
+    _diag_max_profile_steps = 30
+    _diag_profile_step_count = 0
+    _diag_prof = profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False,
+        with_stack=False,
+    )
+    if rank == 0:
+        _diag_prof.start()
+    # ==== DIAG PATCH ここまで ====
     for batch_idx, (
         x,
         x_lengths,
@@ -1072,6 +1085,37 @@ def train_and_evaluate(
                     )
 
         global_step += 1
+
+        # ==== DIAG PATCH: profiler.step() を呼び、Nステップ溜まったらレポートを出して終了する ====
+        if rank == 0:
+            _diag_prof.step()
+            _diag_profile_step_count += 1
+            if _diag_profile_step_count == _diag_max_profile_steps:
+                _diag_prof.stop()
+                logger.info("==== DIAG PROFILER REPORT (self_cuda_time_total 上位30件) ====")
+                logger.info(
+                    "\n"
+                    + _diag_prof.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=30
+                    )
+                )
+                logger.info("==== DIAG PROFILER REPORT (self_cpu_time_total 上位20件) ====")
+                logger.info(
+                    "\n"
+                    + _diag_prof.key_averages().table(
+                        sort_by="self_cpu_time_total", row_limit=20
+                    )
+                )
+                # chrome trace としても保存しておく（chrome://tracing で可視化可能）
+                _trace_path = os.path.join(hps.model_dir, "diag_trace.json")
+                _diag_prof.export_chrome_trace(_trace_path)
+                logger.info(f"==== DIAG: trace を {_trace_path} に保存しました ====")
+                logger.info("==== DIAG: 計測完了のためプロセスを終了します ====")
+                import sys
+
+                sys.exit(0)
+        # ==== DIAG PATCH ここまで ====
+
         if pbar is not None:
             pbar.set_description(
                 f"Epoch {epoch}({100.0 * batch_idx / len(train_loader):.0f}%)/{hps.train.epochs}"
