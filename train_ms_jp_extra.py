@@ -688,6 +688,19 @@ def run():
         pbar.close()
 
 
+# ==== DIAG PATCH: train_and_evaluate はエポックごとに毎回呼び出される関数のため、
+#      profiler関連の状態は関数内ローカル変数ではなくモジュールレベルに置き、
+#      エポックをまたいでも状態が保持されるようにする。
+#      (これがないと、エポックが変わるたびにprofilerが再起動され、
+#       いつまで経っても _diag_max_profile_steps に到達しない)
+_diag_max_profile_steps = 15
+_diag_profile_step_count = 0
+_diag_prof = None
+_diag_started = False
+_diag_finished = False
+# ==== DIAG PATCH ここまで ====
+
+
 def train_and_evaluate(
     rank,
     local_rank,
@@ -733,19 +746,21 @@ def train_and_evaluate(
     if net_wd is not None:
         net_wd.train()
     # ==== DIAG PATCH: torch.profiler を手動start/stopで仕込む ====
-    # start()/stop()方式を使うことで、既存のforループのインデントを一切変更せずに済む。
-    print(f"\n\n[DIAG] rank={rank} local_rank={local_rank} このプロセスでprofilerを起動するか判定中...\n\n", flush=True)
-    logger.info(f"[DIAG] rank={rank} local_rank={local_rank}")
-    _diag_max_profile_steps = 30
-    _diag_profile_step_count = 0
-    _diag_prof = profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=False,
-        with_stack=False,
-    )
-    if rank == 0:
-        _diag_prof.start()
-        print(f"\n\n[DIAG] profiler.start() 実行済み (rank={rank})\n\n", flush=True)
+    # train_and_evaluate はエポックごとに毎回呼ばれるため、モジュールレベルの
+    # グローバル変数を使い、プロセス全体で一度だけ start() するようにする。
+    global _diag_prof, _diag_started, _diag_finished, _diag_profile_step_count
+    if not _diag_started and not _diag_finished:
+        print(f"\n\n[DIAG] rank={rank} local_rank={local_rank} このプロセスでprofilerを起動します\n\n", flush=True)
+        logger.info(f"[DIAG] rank={rank} local_rank={local_rank}")
+        if rank == 0:
+            _diag_prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=False,
+                with_stack=False,
+            )
+            _diag_prof.start()
+            _diag_started = True
+            print(f"\n\n[DIAG] profiler.start() 実行済み (rank={rank})\n\n", flush=True)
     # ==== DIAG PATCH ここまで ====
     for batch_idx, (
         x,
@@ -1090,12 +1105,13 @@ def train_and_evaluate(
         global_step += 1
 
         # ==== DIAG PATCH: profiler.step() を呼び、Nステップ溜まったらレポートを出して終了する ====
-        if rank == 0:
+        if rank == 0 and _diag_started and not _diag_finished:
             _diag_prof.step()
             _diag_profile_step_count += 1
-            if _diag_profile_step_count % 10 == 0:
+            if _diag_profile_step_count % 5 == 0:
                 print(f"\n[DIAG] profiler step count = {_diag_profile_step_count}/{_diag_max_profile_steps}\n", flush=True)
             if _diag_profile_step_count == _diag_max_profile_steps:
+                _diag_finished = True
                 _diag_prof.stop()
 
                 _cuda_table = _diag_prof.key_averages().table(
