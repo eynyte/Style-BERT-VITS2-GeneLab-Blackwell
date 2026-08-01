@@ -734,6 +734,8 @@ def train_and_evaluate(
         net_wd.train()
     # ==== DIAG PATCH: torch.profiler を手動start/stopで仕込む ====
     # start()/stop()方式を使うことで、既存のforループのインデントを一切変更せずに済む。
+    print(f"\n\n[DIAG] rank={rank} local_rank={local_rank} このプロセスでprofilerを起動するか判定中...\n\n", flush=True)
+    logger.info(f"[DIAG] rank={rank} local_rank={local_rank}")
     _diag_max_profile_steps = 30
     _diag_profile_step_count = 0
     _diag_prof = profile(
@@ -743,6 +745,7 @@ def train_and_evaluate(
     )
     if rank == 0:
         _diag_prof.start()
+        print(f"\n\n[DIAG] profiler.start() 実行済み (rank={rank})\n\n", flush=True)
     # ==== DIAG PATCH ここまで ====
     for batch_idx, (
         x,
@@ -1090,29 +1093,57 @@ def train_and_evaluate(
         if rank == 0:
             _diag_prof.step()
             _diag_profile_step_count += 1
+            if _diag_profile_step_count % 10 == 0:
+                print(f"\n[DIAG] profiler step count = {_diag_profile_step_count}/{_diag_max_profile_steps}\n", flush=True)
             if _diag_profile_step_count == _diag_max_profile_steps:
                 _diag_prof.stop()
-                logger.info("==== DIAG PROFILER REPORT (self_cuda_time_total 上位30件) ====")
-                logger.info(
-                    "\n"
-                    + _diag_prof.key_averages().table(
-                        sort_by="self_cuda_time_total", row_limit=30
-                    )
+
+                _cuda_table = _diag_prof.key_averages().table(
+                    sort_by="self_cuda_time_total", row_limit=30
                 )
-                logger.info("==== DIAG PROFILER REPORT (self_cpu_time_total 上位20件) ====")
-                logger.info(
-                    "\n"
-                    + _diag_prof.key_averages().table(
-                        sort_by="self_cpu_time_total", row_limit=20
-                    )
+                _cpu_table = _diag_prof.key_averages().table(
+                    sort_by="self_cpu_time_total", row_limit=20
                 )
-                # chrome trace としても保存しておく（chrome://tracing で可視化可能）
+
+                _report_text = (
+                    "\n\n"
+                    + "#" * 80 + "\n"
+                    + "DIAG PROFILER REPORT START\n"
+                    + "#" * 80 + "\n"
+                    + "\n==== self_cuda_time_total 上位30件 ====\n"
+                    + _cuda_table
+                    + "\n\n==== self_cpu_time_total 上位20件 ====\n"
+                    + _cpu_table
+                    + "\n"
+                    + "#" * 80 + "\n"
+                    + "DIAG PROFILER REPORT END\n"
+                    + "#" * 80 + "\n\n"
+                )
+
+                # 標準出力に直接書く（tqdmのpbarを気にせず強制的に流す）
+                print(_report_text, flush=True)
+
+                # 念のためファイルにも保存しておく（標準出力が信用できない場合の保険）
+                _report_path = os.path.join(hps.model_dir, "diag_profiler_report.txt")
+                try:
+                    with open(_report_path, "w", encoding="utf-8") as f:
+                        f.write(_report_text)
+                    print(f"[DIAG] レポートを {_report_path} にも保存しました\n", flush=True)
+                except Exception as e:
+                    print(f"[DIAG] レポートのファイル保存に失敗: {e!r}\n", flush=True)
+
+                # chrome trace としても保存しておく（chrome://tracing や Perfetto UI で可視化可能）
                 _trace_path = os.path.join(hps.model_dir, "diag_trace.json")
-                _diag_prof.export_chrome_trace(_trace_path)
-                logger.info(f"==== DIAG: trace を {_trace_path} に保存しました ====")
-                logger.info("==== DIAG: 計測完了のためプロセスを終了します ====")
+                try:
+                    _diag_prof.export_chrome_trace(_trace_path)
+                    print(f"[DIAG] trace を {_trace_path} に保存しました\n", flush=True)
+                except Exception as e:
+                    print(f"[DIAG] trace保存に失敗: {e!r}\n", flush=True)
+
+                print("[DIAG] 計測完了のためプロセスを終了します\n", flush=True)
                 import sys
 
+                sys.stdout.flush()
                 sys.exit(0)
         # ==== DIAG PATCH ここまで ====
 
