@@ -71,7 +71,9 @@ class TTSModel:
             model_path (Path): モデル (.safetensors / .onnx) のパス
             config_path (Union[Path, HyperParameters]): ハイパーパラメータ (config.json) のパス (直接 HyperParameters を指定することも可能)
             style_vec_path (Union[Path, NDArray[Any]]): スタイルベクトル (style_vectors.npy) のパス (直接 NDArray を指定することも可能)
-            device (str): PyTorch 推論での音声合成時に利用するデバイス (cpu, cuda, mps など)
+            device (str): PyTorch 推論での音声合成時に利用するデバイス
+                (cpu, cuda, mps など。TPU (torch_xla) で推論する場合は "tpu" または "xla" を指定する。
+                その場合は事前に torch_xla のインストールが必要 (詳細は style_bert_vits2/xla.py を参照))
             onnx_providers (list[str]): ONNX 推論で利用する ExecutionProvider (CPUExecutionProvider, CUDAExecutionProvider など)
         """
 
@@ -306,7 +308,15 @@ class TTSModel:
                 ),
                 window="whole",
             )
-            self.style_vector_inference.to(torch.device(self.device))
+            # pyannote.audio は外部ライブラリであり torch_xla (TPU) での動作を
+            # 確認していないため、self.device が "tpu"/"xla" の場合はこの
+            # (参照音声からのスタイルベクトル抽出という、毎回の音声合成では
+            # なく都度呼ばれるだけの補助的な処理に限り) CPU にフォールバックする。
+            # メインの音声合成本体 (net_g) の推論デバイスには影響しない。
+            from style_bert_vits2.xla import is_xla_device
+
+            style_device = "cpu" if is_xla_device(self.device) else self.device
+            self.style_vector_inference.to(torch.device(style_device))
 
         # 音声からスタイルベクトルを推論
         xvec = self.style_vector_inference(audio_path)
@@ -377,6 +387,8 @@ class TTSModel:
         intonation_scale: float = 1.0,
         null_model_params: Optional[dict[int, NullModelParam]] = None,
         force_reload_model: bool = False,
+        xla_input_buckets: Optional[Sequence[int]] = None,
+        xla_output_buckets: Optional[Sequence[int]] = None,
     ) -> tuple[int, NDArray[Any]]:
         """
         テキストから音声を合成する。
@@ -403,6 +415,12 @@ class TTSModel:
             intonation_scale (float, optional): 抑揚の平均からの変化幅 (1.0 から変更すると若干音質が低下する). Defaults to 1.0.
             null_model_params (Optional[dict[int, NullModelParam]], optional): 推論時に使用するヌルモデルの情報。ONNX 推論では無視される。
             force_reload_model (bool, optional): モデルを強制的に再ロードするかどうか. Defaults to False.
+            xla_input_buckets (Optional[Sequence[int]], optional): self.device が "tpu"/"xla" の場合に、
+                入力音素列の長さを丸め込むバケツ。省略時は自動で妥当なデフォルト値が使われる。
+                TPU/XLA 以外のデバイスでは無視される。Defaults to None.
+            xla_output_buckets (Optional[Sequence[int]], optional): self.device が "tpu"/"xla" の場合に、
+                生成される音声のフレーム数を丸め込むバケツ。省略時は自動で妥当なデフォルト値が使われる。
+                TPU/XLA 以外のデバイスでは無視される。Defaults to None.
         Returns:
             tuple[int, NDArray[Any]]: サンプリングレートと音声データ (16bit PCM)
         """
@@ -466,6 +484,8 @@ class TTSModel:
                         style_vec=style_vector,
                         given_phone=given_phone,
                         given_tone=given_tone,
+                        xla_input_buckets=xla_input_buckets,
+                        xla_output_buckets=xla_output_buckets,
                     )
 
             # 改行ごとに分割して音声を生成
@@ -489,6 +509,8 @@ class TTSModel:
                                 assist_text=assist_text,
                                 assist_text_weight=assist_text_weight,
                                 style_vec=style_vector,
+                                xla_input_buckets=xla_input_buckets,
+                                xla_output_buckets=xla_output_buckets,
                             )
                         )
                         if i != len(texts) - 1:
@@ -607,7 +629,8 @@ class TTSModelHolder:
 
         Args:
             model_root_dir (Path): 音声合成モデルが配置されているディレクトリのパス
-            device (str): PyTorch 推論での音声合成時に利用するデバイス (cpu, cuda, mps など)
+            device (str): PyTorch 推論での音声合成時に利用するデバイス
+                (cpu, cuda, mps など。TPU (torch_xla) で推論する場合は "tpu" または "xla" を指定する)
             onnx_providers (list[str]): ONNX 推論で利用する ExecutionProvider (CPUExecutionProvider, CUDAExecutionProvider など)
             ignore_onnx (bool, optional): ONNX モデルを除外するかどうか. Defaults to False.
         """

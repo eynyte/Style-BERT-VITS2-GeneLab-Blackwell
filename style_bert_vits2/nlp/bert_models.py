@@ -27,6 +27,7 @@ from transformers import (
 from style_bert_vits2.constants import DEFAULT_BERT_MODEL_PATHS, Languages
 from style_bert_vits2.logging import logger
 from style_bert_vits2.nlp import onnx_bert_models
+from style_bert_vits2.xla import resolve_device
 
 
 if TYPE_CHECKING:
@@ -182,7 +183,7 @@ def load_tokenizer(
     return __loaded_tokenizers[language]
 
 
-def transfer_model(language: Languages, device: str) -> None:
+def transfer_model(language: Languages, device: Union[str, "torch.device"]) -> None:
     """
     指定された言語の BERT モデルを、指定されたデバイスに移動する。
     モデルのロード後に推論デバイスを変更したい場合に利用する。
@@ -190,22 +191,28 @@ def transfer_model(language: Languages, device: str) -> None:
 
     Args:
         language (Languages): モデルを移動する言語
-        device (str): モデルを移動するデバイス
+        device (Union[str, torch.device]): モデルを移動するデバイス。
+            "tpu"/"xla" を指定した場合は torch_xla 経由で実際のデバイスに解決される。
     """
 
     if language not in __loaded_models:
         raise ValueError(f"BERT model for {language.name} is not loaded.")
 
+    # "tpu"/"xla" が指定された場合、実際の torch_xla デバイスオブジェクトに変換する。
+    # それ以外 ("cpu"/"cuda"/"cuda:0"/"mps" 等) はそのまま返るため挙動は変わらない。
+    resolved_device = resolve_device(device)
+
     # 既に指定されたデバイスにモデルがロードされている場合は何もしない
     # ex: current_device="cuda:0", device="cuda" → 何もしない
     # ex: current_device="cuda:0", device="cpu" → モデルを CPU に移動
+    # device は torch.device の場合もあるため、比較は文字列表現同士で行う
     current_device = str(__loaded_models[language].device)
-    if current_device.startswith(device):
+    if current_device.startswith(str(resolved_device)):
         return
 
-    __loaded_models[language].to(device)  # type: ignore
+    __loaded_models[language].to(resolved_device)  # type: ignore
     logger.info(
-        f"Transferred the {language.name} BERT model from {current_device} to {device}"
+        f"Transferred the {language.name} BERT model from {current_device} to {resolved_device}"
     )
 
 

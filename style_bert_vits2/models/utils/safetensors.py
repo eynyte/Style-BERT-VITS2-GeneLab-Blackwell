@@ -6,6 +6,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from style_bert_vits2.logging import logger
+from style_bert_vits2.xla import is_xla_device
 
 
 def load_safetensors(
@@ -26,9 +27,17 @@ def load_safetensors(
         tuple[torch.nn.Module, Optional[int]]: 読み込まれたモデルとイテレーション回数（存在する場合）
     """
 
+    # safetensors ライブラリ (Rust 実装) は "tpu"/"xla" というデバイス種別を
+    # 認識できないため、TPU/XLA 向けには常に CPU 上へロードする。model 自体は
+    # 呼び出し側で既に目的のデバイスへ .to() 済みなので、後段の
+    # load_state_dict() の Tensor.copy_() が CPU→XLA への転送を正しく行う。
+    # それ以外のデバイス (cpu/cuda/mps 等) では従来通り device をそのまま渡す
+    # (cuda の場合は safetensors が直接 GPU へロードする最適化を維持できる)。
+    open_device = "cpu" if is_xla_device(device) else device
+
     tensors: dict[str, Any] = {}
     iteration: Optional[int] = None
-    with safe_open(str(checkpoint_path), framework="pt", device=device) as f:  # type: ignore
+    with safe_open(str(checkpoint_path), framework="pt", device=open_device) as f:  # type: ignore
         for key in f.keys():
             if key == "iteration":
                 iteration = f.get_tensor(key).item()

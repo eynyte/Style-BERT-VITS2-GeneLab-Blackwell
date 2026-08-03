@@ -7,6 +7,7 @@ from typing import Any, Optional, Union
 import torch
 
 from style_bert_vits2.logging import logger
+from style_bert_vits2.xla import is_xla_device
 
 
 def load_checkpoint(
@@ -32,7 +33,13 @@ def load_checkpoint(
     """
 
     assert os.path.isfile(checkpoint_path)
-    checkpoint_dict = torch.load(checkpoint_path, map_location=device)
+    # torch.load の map_location は "tpu"/"xla" (torch_xla のデバイス) を安定して
+    # 扱えないため、TPU/XLA 向けには常に CPU へロードする。model 自体は呼び出し側で
+    # 既に目的のデバイスへ .to() 済みなので、後段の load_state_dict() の
+    # Tensor.copy_() が CPU→XLA への転送を正しく行ってくれる。
+    # それ以外のデバイス (cpu/cuda/mps 等) では従来通り device をそのまま渡す。
+    load_map_location = "cpu" if is_xla_device(device) else device
+    checkpoint_dict = torch.load(checkpoint_path, map_location=load_map_location)
     iteration = checkpoint_dict["iteration"]
     learning_rate = checkpoint_dict["learning_rate"]
     logger.info(

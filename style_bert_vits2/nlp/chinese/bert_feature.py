@@ -39,23 +39,33 @@ def extract_bert_feature(
 
     import torch
 
+    from style_bert_vits2.xla import is_xla_device, resolve_device
+
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
-    model = bert_models.load_model(Languages.ZH, device_map=device)
+    # accelerate の device_map は "tpu"/"xla" を正しく扱えないため、その場合は
+    # device_map を渡さずに通常ロード (CPU 上) し、直後の transfer_model() で
+    # torch_xla 経由の実デバイスへ明示的に転送する。それ以外のデバイスでは
+    # 従来通り device_map にそのまま device を渡す (挙動は変わらない)。
+    model = bert_models.load_model(
+        Languages.ZH,
+        device_map=None if is_xla_device(device) else device,
+    )
     bert_models.transfer_model(Languages.ZH, device)
+    resolved_device = resolve_device(device)
 
     style_res_mean = None
     with torch.no_grad():
         tokenizer = bert_models.load_tokenizer(Languages.ZH)
         inputs = tokenizer(text, return_tensors="pt")
         for i in inputs:
-            inputs[i] = inputs[i].to(device)  # type: ignore
+            inputs[i] = inputs[i].to(resolved_device)  # type: ignore
         res = model(**inputs, output_hidden_states=True)
         res = torch.cat(res["hidden_states"][-3:-2], -1)[0].cpu()
         if assist_text:
             style_inputs = tokenizer(assist_text, return_tensors="pt")
             for i in style_inputs:
-                style_inputs[i] = style_inputs[i].to(device)  # type: ignore
+                style_inputs[i] = style_inputs[i].to(resolved_device)  # type: ignore
             style_res = model(**style_inputs, output_hidden_states=True)
             style_res = torch.cat(style_res["hidden_states"][-3:-2], -1)[0].cpu()
             style_res_mean = style_res.mean(0)

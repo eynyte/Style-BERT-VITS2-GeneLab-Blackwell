@@ -1,14 +1,38 @@
 import math
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
 from torch import nn
+from torch.cuda.amp import autocast
 from torch.nn import Conv1d, Conv2d, ConvTranspose1d
 from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 
 from style_bert_vits2.models import attentions, commons, modules, monotonic_alignment
 from style_bert_vits2.nlp.symbols import NUM_LANGUAGES, NUM_TONES, SYMBOLS
+from style_bert_vits2.xla import pick_bucket, warn_bucket_overflow
+
+
+def _assert_finite(tensor: Optional[torch.Tensor], name: str) -> None:
+    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。
+    問題箇所が判明したら削除して構わない。"""
+    if tensor is None:
+        return
+    if not torch.isfinite(tensor).all():
+        nan_count = int(torch.isnan(tensor).sum().item())
+        inf_count = int(torch.isinf(tensor).sum().item())
+        finite_vals = tensor[torch.isfinite(tensor)]
+        if finite_vals.numel() > 0:
+            finite_min = finite_vals.min().item()
+            finite_max = finite_vals.max().item()
+        else:
+            finite_min = finite_max = float("nan")
+        raise RuntimeError(
+            f"[fp16 debug] '{name}' に非有限値を検出: NaN={nan_count}, Inf={inf_count}, "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"finite_range=({finite_min:.4g}, {finite_max:.4g})"
+        )
 
 
 class DurationDiscriminator(nn.Module):  # vits2
@@ -1073,7 +1097,34 @@ class SynthesizerTrn(nn.Module):
 
         w = attn.sum(2)
 
-        l_length_sdp = self.sdp(x, x_mask, w, g=g)
+        # [fp16 debug / fix] fp16実行時のみ、self.sdp をfp32で計算し診断チェックも行う。
+        # bf16/fp32実行時はこの介入は不要かつ余計なコストになるため、元の実装のまま通す。
+        fp16_active = (
+            torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+        )
+        if fp16_active:
+            # self.sdp に渡る直前の時点で x/x_mask/w/g が既に壊れていないか確認する。
+            # ここで例外が出れば「self.sdpより手前(エンコーダ等)で既にNaN/Infが発生している」と確定する。
+            # ここを通過して尚 self.sdp 内部でクラッシュする場合は、fp32化しても直らない
+            # 何か別の原因(事前学習チェックポイント自体の破損等)を疑う必要がある。
+            _assert_finite(x, "x (pre-sdp)")
+            _assert_finite(x_mask, "x_mask (pre-sdp)")
+            _assert_finite(w, "w (pre-sdp)")
+            _assert_finite(g, "g (pre-sdp)")
+
+            # StochasticDurationPredictor は正規化フロー内部で exp/log を多用するため、
+            # fp16 autocast 下だと極端な値が容易に inf/NaN 化し、後段の
+            # rational_quadratic_spline で「入力が空集合」エラーを誘発する。
+            # 生成器全体のfp16化とは切り離し、このサブモジュールだけ明示的にfp32で計算する。
+            with autocast(enabled=False):
+                l_length_sdp = self.sdp(
+                    x.float(),
+                    x_mask.float(),
+                    w.float(),
+                    g=g.float() if g is not None else None,
+                )
+        else:
+            l_length_sdp = self.sdp(x, x_mask, w, g=g)
         l_length_sdp = l_length_sdp / torch.sum(x_mask)
 
         logw_ = torch.log(w + 1e-6) * x_mask
@@ -1121,6 +1172,7 @@ class SynthesizerTrn(nn.Module):
         max_len: Optional[int] = None,
         sdp_ratio: float = 0.0,
         y: Optional[torch.Tensor] = None,
+        fixed_len_buckets: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
         # x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, tone, language, bert)
         # g = self.gst(y)
@@ -1132,13 +1184,45 @@ class SynthesizerTrn(nn.Module):
         x, m_p, logs_p, x_mask = self.enc_p(
             x, x_lengths, tone, language, bert, style_vec, g=g
         )
-        logw = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w) * (
-            sdp_ratio
-        ) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
+        # 学習時と同じ理由で、推論時もfp16実行時のみこのサブモジュールをfp32で計算する。
+        infer_fp16_active = (
+            torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+        )
+        if infer_fp16_active:
+            with autocast(enabled=False):
+                logw_sdp = self.sdp(
+                    x.float(),
+                    x_mask.float(),
+                    g=g.float() if g is not None else None,
+                    reverse=True,
+                    noise_scale=noise_scale_w,
+                )
+        else:
+            logw_sdp = self.sdp(
+                x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w
+            )
+        logw = logw_sdp * (sdp_ratio) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
-        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
+
+        # --- TPU/XLA 向け: 出力フレーム長をバケツに丸めて形状を固定する ---
+        # y_lengths (=生成フレーム数) は入力テキストや noise_scale 等によって
+        # 呼び出しごとに変わる。何も対策しないと、後段で作る y_mask / attn / z / o の
+        # 形状がそのたびに変わってしまい、XLA が毎回コンパイルし直すことになる。
+        # fixed_len_buckets が指定されている場合のみ、実測の最大長以上で最小の
+        # バケツ長に切り上げて y_mask を作る (=マスクの値そのものは真の y_lengths の
+        # ままなので、切り上げた分の余白フレームは従来通り 0 埋めされる)。
+        # fixed_len_buckets を渡さなければ、この分岐は通らず従来と完全に同じ挙動になる。
+        max_length: Optional[int] = None
+        if fixed_len_buckets:
+            true_max_len = int(y_lengths.max().item())  # ここだけ小さな同期が入る
+            max_length = pick_bucket(true_max_len, fixed_len_buckets)
+            if max_length is None:
+                warn_bucket_overflow("生成フレーム数", true_max_len, fixed_len_buckets)
+                max_length = true_max_len
+
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, max_length), 1).to(
             x_mask.dtype
         )
         attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)

@@ -1,4 +1,5 @@
 import math
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
@@ -9,6 +10,7 @@ from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 
 from style_bert_vits2.models import attentions, commons, modules, monotonic_alignment
 from style_bert_vits2.nlp.symbols import NUM_LANGUAGES, NUM_TONES, SYMBOLS
+from style_bert_vits2.xla import pick_bucket, warn_bucket_overflow
 
 
 class DurationDiscriminator(nn.Module):  # vits2
@@ -1066,6 +1068,7 @@ class SynthesizerTrn(nn.Module):
         max_len: Optional[int] = None,
         sdp_ratio: float = 0.0,
         y: Optional[torch.Tensor] = None,
+        fixed_len_buckets: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
         # x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, tone, language, bert)
         # g = self.gst(y)
@@ -1083,7 +1086,19 @@ class SynthesizerTrn(nn.Module):
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
-        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
+
+        # --- TPU/XLA 向け: 出力フレーム長をバケツに丸めて形状を固定する ---
+        # 詳細は models_jp_extra.py の SynthesizerTrn.infer() 内の同様の箇所を参照。
+        # fixed_len_buckets を渡さなければ、この分岐は通らず従来と完全に同じ挙動になる。
+        max_length: Optional[int] = None
+        if fixed_len_buckets:
+            true_max_len = int(y_lengths.max().item())  # ここだけ小さな同期が入る
+            max_length = pick_bucket(true_max_len, fixed_len_buckets)
+            if max_length is None:
+                warn_bucket_overflow("生成フレーム数", true_max_len, fixed_len_buckets)
+                max_length = true_max_len
+
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, max_length), 1).to(
             x_mask.dtype
         )
         attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)

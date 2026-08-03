@@ -34,6 +34,19 @@ def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(path).to(device=device, dtype=dtype)
 
 
+from super_monotonic_align import maximum_path as _sma_maximum_path
+def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    sbv2/VITS 側: neg_cent, mask は [B, T_mel, T_text]
+    super-monotonic-align 側: [B, T_text, T_mel] (Glow-TTS 由来) を要求するため
+    dim1/dim2 を入れ替えてから渡し、結果をまた入れ替えて戻す。
+    """
+    dtype = neg_cent.dtype
+    neg_cent_t = neg_cent.transpose(1, 2).float()   # [B, T_text, T_mel], fp32
+    mask_t = mask.transpose(1, 2).to(torch.int32)   # [B, T_text, T_mel]
+    path_t = _sma_maximum_path(neg_cent_t, mask_t, dtype=torch.float32)
+    return path_t.transpose(1, 2).to(dtype)          # [B, T_mel, T_text] に戻す
+
 @numba.jit(
     numba.void(
         numba.int32[:, :, ::1],

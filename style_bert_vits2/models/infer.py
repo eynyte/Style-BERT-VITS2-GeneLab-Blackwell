@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import Any, Optional, Union, cast
 
 import torch
@@ -17,11 +18,24 @@ from style_bert_vits2.nlp import (
     extract_bert_feature,
 )
 from style_bert_vits2.nlp.symbols import SYMBOLS
+from style_bert_vits2.xla import (
+    default_input_length_buckets,
+    default_output_length_buckets,
+    is_xla_device,
+    mark_step,
+    pad_last_dim,
+    pick_bucket,
+    resolve_device,
+    warn_bucket_overflow,
+)
 
 
 def get_net_g(
     model_path: str, version: str, device: str, hps: HyperParameters
 ) -> Union[SynthesizerTrn, SynthesizerTrnJPExtra]:
+    # "tpu"/"xla" が指定された場合、ここで実際の torch_xla デバイスオブジェクトに変換する。
+    # "cpu"/"cuda"/"mps" 等はそのまま返るため、以降の挙動は一切変わらない。
+    resolved_device = resolve_device(device)
     if version.endswith("JP-Extra"):
         logger.info("Using JP-Extra model")
         net_g = SynthesizerTrnJPExtra(
@@ -52,7 +66,7 @@ def get_net_g(
             use_spectral_norm=hps.model.use_spectral_norm,
             gin_channels=hps.model.gin_channels,
             slm=hps.model.slm,
-        ).to(device)
+        ).to(resolved_device)
     else:
         logger.info("Using normal model")
         net_g = SynthesizerTrn(
@@ -83,15 +97,17 @@ def get_net_g(
             use_spectral_norm=hps.model.use_spectral_norm,
             gin_channels=hps.model.gin_channels,
             slm=hps.model.slm,
-        ).to(device)
+        ).to(resolved_device)
     net_g.state_dict()
     _ = net_g.eval()
     if model_path.endswith(".pth") or model_path.endswith(".pt"):
         _ = utils.checkpoints.load_checkpoint(
-            model_path, net_g, None, skip_optimizer=True, device=device
+            model_path, net_g, None, skip_optimizer=True, device=resolved_device
         )
     elif model_path.endswith(".safetensors"):
-        _ = utils.safetensors.load_safetensors(model_path, net_g, True, device=device)
+        _ = utils.safetensors.load_safetensors(
+            model_path, net_g, True, device=resolved_device
+        )
     else:
         raise ValueError(f"Unknown model format: {model_path}")
     return net_g
@@ -182,7 +198,24 @@ def infer(
     assist_text_weight: float = 0.7,
     given_phone: Optional[list[str]] = None,
     given_tone: Optional[list[int]] = None,
+    xla_input_buckets: Optional[Sequence[int]] = None,
+    xla_output_buckets: Optional[Sequence[int]] = None,
 ) -> NDArray[Any]:
+    """
+    Args (TPU/XLA 関連のみ抜粋):
+        xla_input_buckets (Optional[Sequence[int]]): device が "tpu"/"xla" のとき、
+            入力音素列をこの中から実際の長さ以上で最小の値までゼロ埋めしてから
+            推論する。同じバケツに収まる文同士は XLA のコンパイル結果を使い回せる
+            ため、2 回目以降が高速になる。省略時 (None) は device が TPU/XLA なら
+            style_bert_vits2.xla.default_input_length_buckets() の値が自動的に
+            使われる。device が TPU/XLA でない場合は常に無視される
+            (=CPU/GPU では以前と全く同じ挙動になる)。
+        xla_output_buckets (Optional[Sequence[int]]): 生成する音声のフレーム数
+            (Duration Predictor が予測する長さ) を丸め込むバケツ。使い方・省略時の
+            挙動は xla_input_buckets と同様
+            (style_bert_vits2.xla.default_output_length_buckets(hps) が使われる)。
+    """
+
     is_jp_extra = hps.version.endswith("JP-Extra")
     bert, ja_bert, en_bert, phones, tones, lang_ids = get_text(
         text,
@@ -209,17 +242,50 @@ def infer(
         ja_bert = ja_bert[:, :-2]
         en_bert = en_bert[:, :-2]
 
+    # "tpu"/"xla" が指定された場合、ここで実際の torch_xla デバイスオブジェクトに変換する。
+    # それ以外のデバイスでは resolved_device は device (元の文字列) と同じ値になるため、
+    # 以降の .to() 呼び出しの挙動は一切変わらない。
+    resolved_device = resolve_device(device)
+    use_xla = is_xla_device(device)
+
+    # TPU/XLA 使用時のみ、明示的な指定がなければデフォルトの長さバケツを適用する。
+    # CPU/GPU では xla_input_buckets/xla_output_buckets は常に None のままなので、
+    # 以降のパディング/バケツ化処理は丸ごとスキップされ、元の実装と完全に同じ
+    # 形状・同じ結果になる (=このパッチによる CPU/GPU 推論への副作用はない)。
+    if use_xla and xla_input_buckets is None:
+        xla_input_buckets = default_input_length_buckets()
+    if use_xla and xla_output_buckets is None:
+        xla_output_buckets = default_output_length_buckets(hps)
+
     with torch.no_grad():
-        x_tst = phones.to(device).unsqueeze(0)
-        tones = tones.to(device).unsqueeze(0)
-        lang_ids = lang_ids.to(device).unsqueeze(0)
-        bert = bert.to(device).unsqueeze(0)
-        ja_bert = ja_bert.to(device).unsqueeze(0)
-        en_bert = en_bert.to(device).unsqueeze(0)
-        x_tst_lengths = torch.LongTensor([phones.size(0)]).to(device)
-        style_vec_tensor = torch.from_numpy(style_vec).to(device).unsqueeze(0)
+        true_x_len = phones.size(0)  # ゼロ埋めする前の「真の」音素列長を控えておく
+
+        input_bucket_len: Optional[int] = None
+        if xla_input_buckets:
+            input_bucket_len = pick_bucket(true_x_len, xla_input_buckets)
+            if input_bucket_len is None:
+                warn_bucket_overflow("入力音素長", true_x_len, xla_input_buckets)
+                # バケツに収まらない場合は諦めて実測の長さのまま進む (切り詰めない)
+
+        def _to_device_and_pad(t: torch.Tensor) -> torch.Tensor:
+            t = t.to(resolved_device)
+            if input_bucket_len is not None:
+                t = pad_last_dim(t, input_bucket_len)
+            return t.unsqueeze(0)
+
+        x_tst = _to_device_and_pad(phones)
+        tones = _to_device_and_pad(tones)
+        lang_ids = _to_device_and_pad(lang_ids)
+        bert = _to_device_and_pad(bert)
+        ja_bert = _to_device_and_pad(ja_bert)
+        en_bert = _to_device_and_pad(en_bert)
+        # モデル側の x_mask 計算に使われるのは常にパディング前の「真の」音素長。
+        # (テンソル自体の見た目の長さがバケツ長になっていても、これにより
+        #  パディング部分は attention 含めて正しくマスクされ、結果は元と一致する)
+        x_tst_lengths = torch.LongTensor([true_x_len]).to(resolved_device)
+        style_vec_tensor = torch.from_numpy(style_vec).to(resolved_device).unsqueeze(0)
         del phones
-        sid_tensor = torch.LongTensor([sid]).to(device)
+        sid_tensor = torch.LongTensor([sid]).to(resolved_device)
 
         if is_jp_extra:
             output = cast(SynthesizerTrnJPExtra, net_g).infer(
@@ -234,6 +300,7 @@ def infer(
                 sdp_ratio=sdp_ratio,
                 noise_scale=noise_scale,
                 noise_scale_w=noise_scale_w,
+                fixed_len_buckets=xla_output_buckets,
             )
         else:
             output = cast(SynthesizerTrn, net_g).infer(
@@ -250,9 +317,17 @@ def infer(
                 sdp_ratio=sdp_ratio,
                 noise_scale=noise_scale,
                 noise_scale_w=noise_scale_w,
+                fixed_len_buckets=xla_output_buckets,
             )
 
         audio = output[0][0, 0].data.cpu().float().numpy()
+
+        # 出力側もバケツ化している場合、生成された波形はバケツ長ぶん余分に
+        # 長い (末尾は y_mask が 0 になっている無音相当の区間) ので、
+        # 実際に有効なフレーム数を y_mask から求めて波形を切り詰める。
+        if xla_output_buckets:
+            true_frames = int(output[2][0, 0].sum().item())
+            audio = audio[: true_frames * hps.data.hop_length]
 
         del (
             x_tst,
@@ -267,5 +342,8 @@ def infer(
         )  # , emo
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        # torch_xla 使用時、ここまでで .cpu()/.item() により計算グラフは実行済みだが、
+        # 念のため明示的に区切っておく (TPU/XLA 以外では no-op)。
+        mark_step(resolved_device)
 
         return audio
